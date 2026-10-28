@@ -1340,12 +1340,9 @@ fn monotonic_micros() -> u64 {
 
 const GBM_FORMAT_XRGB8888: u32 = 0x3432_5258;
 
-/// the panel, driven through KMS from a GBM surface the context draws into.
-struct Kms {
-    drm: libloading::Library,
-    gbm: libloading::Library,
-    fd: i32,
-    device: *mut c_void,
+/// one panel: a GBM surface and the CRTC and connector it is shown on. A
+/// handheld with two panels, as the RG DS Plus has, gets one of these each.
+struct KmsHead {
     surface: *mut c_void,
     crtc: u32,
     connector: u32,
@@ -1353,6 +1350,21 @@ struct Kms {
     shown: Option<(*mut c_void, u32)>,
     pending: Option<(*mut c_void, u32)>,
     set: bool,
+}
+
+impl KmsHead {
+    fn size(&self) -> (i32, i32) {
+        (self.mode.hdisplay as i32, self.mode.vdisplay as i32)
+    }
+}
+
+/// the panels, driven through KMS from GBM surfaces the context draws into.
+struct Kms {
+    drm: libloading::Library,
+    gbm: libloading::Library,
+    fd: i32,
+    device: *mut c_void,
+    heads: Vec<KmsHead>,
     /// how many pictures stayed up for 1, 2, 3 and 4 or more panel
     /// refreshes, logged every few seconds: at an even frame rate they all
     /// stay up as long.
@@ -1397,7 +1409,8 @@ impl Kms {
             return Err("no KMS resources".into());
         }
         let res = &*resources;
-        let mut found = None;
+        let mut found = Vec::new();
+        let mut used_crtcs = 0u32;
         for i in 0..res.count_connectors as usize {
             let connector = call!(drm, "drmModeGetConnector", fn(i32, u32) -> *mut DrmModeConnector, fd, *res.connectors.add(i));
             if connector.is_null() {
@@ -1408,52 +1421,136 @@ impl Kms {
                 let modes = std::slice::from_raw_parts(c.modes, c.count_modes as usize);
                 let mode = *modes.iter().find(|mode| mode.kind & (1 << 3) != 0).unwrap_or(&modes[0]);
                 let mut crtc = 0;
-                let encoder = call!(drm, "drmModeGetEncoder", fn(i32, u32) -> *mut DrmModeEncoder, fd, c.encoder_id);
-                if !encoder.is_null() {
-                    crtc = (*encoder).crtc_id;
-                    call!(drm, "drmModeFreeEncoder", fn(*mut DrmModeEncoder) -> (), encoder);
+                let mut possible = 0u32;
+                // a cold boot leaves encoder_id at 0 until a mode has been
+                // set, so the connector's own encoders say which CRTCs it
+                // can drive: both panels on the first one never works
+                if c.encoder_id != 0 {
+                    let encoder = call!(drm, "drmModeGetEncoder", fn(i32, u32) -> *mut DrmModeEncoder, fd, c.encoder_id);
+                    if !encoder.is_null() {
+                        crtc = (*encoder).crtc_id;
+                        possible = (*encoder).possible_crtcs;
+                        call!(drm, "drmModeFreeEncoder", fn(*mut DrmModeEncoder) -> (), encoder);
+                    }
+                }
+                if crtc == 0 {
+                    for e in 0..c.count_encoders.max(0) as usize {
+                        let encoder = call!(drm, "drmModeGetEncoder", fn(i32, u32) -> *mut DrmModeEncoder, fd, *c.encoders.add(e));
+                        if !encoder.is_null() {
+                            possible |= (*encoder).possible_crtcs;
+                            call!(drm, "drmModeFreeEncoder", fn(*mut DrmModeEncoder) -> (), encoder);
+                        }
+                    }
+                }
+                if crtc == 0 && possible != 0 {
+                    for k in 0..res.count_crtcs as usize {
+                        if possible & (1u32 << k) != 0 && used_crtcs & (1u32 << k) == 0 {
+                            crtc = *res.crtcs.add(k);
+                            break;
+                        }
+                    }
                 }
                 if crtc == 0 && res.count_crtcs > 0 {
-                    crtc = *res.crtcs;
+                    for k in 0..res.count_crtcs as usize {
+                        if used_crtcs & (1u32 << k) == 0 {
+                            crtc = *res.crtcs.add(k);
+                            break;
+                        }
+                    }
                 }
-                found = Some((c.connector_id, mode, crtc));
+                if crtc == 0 {
+                    call!(drm, "drmModeFreeConnector", fn(*mut DrmModeConnector) -> (), connector);
+                    continue;
+                }
+                for k in 0..res.count_crtcs as usize {
+                    if *res.crtcs.add(k) == crtc {
+                        used_crtcs |= 1u32 << k;
+                        break;
+                    }
+                }
+                found.push((c.connector_id, mode, crtc));
             }
             call!(drm, "drmModeFreeConnector", fn(*mut DrmModeConnector) -> (), connector);
-            if found.is_some() {
+            if found.len() == 2 {
                 break;
             }
         }
         call!(drm, "drmModeFreeResources", fn(*mut DrmModeRes) -> (), resources);
-        let (connector, mode, crtc) = found.ok_or("no connected display")?;
-        let refresh = mode.clock as f64 * 1000.0 / (mode.htotal as f64 * mode.vtotal as f64);
-        log::info!("panel {}x{} at {refresh:.3} Hz", mode.hdisplay, mode.vdisplay);
+        if found.is_empty() {
+            return Err("no connected display".into());
+        }
+        found.sort_by_key(|(connector, _, _)| *connector);
+        let mut heads = Vec::with_capacity(found.len());
+        let mut refresh = 0.0;
+        for (connector, mode, crtc) in found {
+            let surface = call!(
+                gbm,
+                "gbm_surface_create",
+                fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void,
+                device,
+                mode.hdisplay as u32,
+                mode.vdisplay as u32,
+                GBM_FORMAT_XRGB8888,
+                1 | 4
+            );
+            if surface.is_null() {
+                return Err("no GBM surface".into());
+            }
+            refresh = mode.clock as f64 * 1000.0 / (mode.htotal as f64 * mode.vtotal as f64);
+            log::info!("panel {}x{} at {refresh:.3} Hz on CRTC {crtc}, connector {connector}", mode.hdisplay, mode.vdisplay);
+            heads.push(KmsHead { surface, crtc, connector, mode, shown: None, pending: None, set: false });
+        }
         if (50.0..70.0).contains(&refresh) {
             PANEL_PERIOD.store((1e9 / refresh) as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        let surface = call!(
-            gbm,
-            "gbm_surface_create",
-            fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void,
-            device,
-            mode.hdisplay as u32,
-            mode.vdisplay as u32,
-            GBM_FORMAT_XRGB8888,
-            1 | 4
-        );
-        if surface.is_null() {
-            return Err("no GBM surface".into());
+        // a CRTC can still carry the boot framebuffer, and the first SetCrtc
+        // with a GBM framebuffer is refused until a mode has been set once
+        for head in &heads {
+            let mut connector = head.connector;
+            let mut mode = head.mode;
+            let result = call!(
+                drm,
+                "drmModeSetCrtc",
+                fn(i32, u32, u32, u32, u32, *mut u32, i32, *mut DrmModeInfo) -> i32,
+                fd,
+                head.crtc,
+                0,
+                0,
+                0,
+                &mut connector,
+                1,
+                &mut mode
+            );
+            if result != 0 {
+                log::warn!("could not blank CRTC {} before setting it, {result}", head.crtc);
+            }
         }
-        Ok(Kms { drm, gbm, fd, device, surface, crtc, connector, mode, shown: None, pending: None, set: false, held: [0; 4], held_since: std::time::Instant::now(), last_flip: 0, asked: 0, slack: (0, 0) })
+        if heads.len() > 1 {
+            log::info!("driving {} panels, a screen on each", heads.len());
+        }
+        Ok(Kms { drm, gbm, fd, device, heads, held: [0; 4], held_since: std::time::Instant::now(), last_flip: 0, asked: 0, slack: (0, 0) })
     }
 
     fn size(&self) -> (i32, i32) {
-        (self.mode.hdisplay as i32, self.mode.vdisplay as i32)
+        self.heads[0].size()
+    }
+
+    /// one panel's size, the first panel's when there is no second.
+    fn size_of(&self, head: usize) -> (i32, i32) {
+        self.heads.get(head).map_or_else(|| self.size(), KmsHead::size)
+    }
+
+    /// the surface of one panel.
+    fn surface(&self, head: usize) -> *mut c_void {
+        self.heads.get(head).map_or(self.heads[0].surface, |head| head.surface)
     }
 
     /// waits for the flip queued last to happen, then lets go of the
     /// buffer it replaced.
     fn settle(&mut self) -> Result<(), String> {
-        let Some(pending) = self.pending.take() else { return Ok(()) };
+        if self.heads.iter().all(|head| head.pending.is_none()) {
+            return Ok(());
+        }
         // SAFETY: as in open, on the descriptor and buffers this holds
         unsafe {
             let mut context = DrmEventContext { version: 2, vblank_handler: None, page_flip_handler: Some(flipped) };
@@ -1478,9 +1575,12 @@ impl Kms {
                     self.held_since = std::time::Instant::now();
                 }
             }
-            if let Some((bo, fb)) = self.shown.replace(pending) {
-                call!(self.drm, "drmModeRmFB", fn(i32, u32) -> i32, self.fd, fb);
-                call!(self.gbm, "gbm_surface_release_buffer", fn(*mut c_void, *mut c_void) -> (), self.surface, bo);
+            for head in &mut self.heads {
+                let Some(pending) = head.pending.take() else { continue };
+                if let Some((bo, fb)) = head.shown.replace(pending) {
+                    call!(self.drm, "drmModeRmFB", fn(i32, u32) -> i32, self.fd, fb);
+                    call!(self.gbm, "gbm_surface_release_buffer", fn(*mut c_void, *mut c_void) -> (), head.surface, bo);
+                }
             }
         }
         Ok(())
@@ -1491,8 +1591,11 @@ impl Kms {
     /// a picture goes up no sooner than as many refreshes after the last as
     /// the game's frames between them, two at most, so none flashes by for
     /// one refresh and a game behind is never held up further.
-    fn flip(&mut self, frames: u32) -> Result<(), String> {
-        self.settle()?;
+    fn flip(&mut self, index: usize, frames: u32) -> Result<(), String> {
+        if self.heads.len() == 1 {
+            self.settle()?;
+        }
+        let head = self.heads.get_mut(index).ok_or_else(|| format!("no panel {index}"))?;
         let period = PANEL_PERIOD.load(std::sync::atomic::Ordering::Relaxed) / 1000;
         let mut paced = false;
         if frames > 1 && period > 0 && self.last_flip != 0 {
@@ -1505,13 +1608,13 @@ impl Kms {
         }
         // SAFETY: as in open, the buffer object is the surface's front one
         unsafe {
-            let bo = call!(self.gbm, "gbm_surface_lock_front_buffer", fn(*mut c_void) -> *mut c_void, self.surface);
+            let bo = call!(self.gbm, "gbm_surface_lock_front_buffer", fn(*mut c_void) -> *mut c_void, head.surface);
             if bo.is_null() {
                 return Err("no front buffer".into());
             }
             let handle = call!(self.gbm, "gbm_bo_get_handle", fn(*mut c_void) -> u64, bo) as u32;
             let stride = call!(self.gbm, "gbm_bo_get_stride", fn(*mut c_void) -> u32, bo);
-            let (width, height) = self.size();
+            let (width, height) = head.size();
             let mut fb = 0u32;
             let added = call!(
                 self.drm,
@@ -1527,18 +1630,18 @@ impl Kms {
                 &mut fb
             );
             if added != 0 {
-                call!(self.gbm, "gbm_surface_release_buffer", fn(*mut c_void, *mut c_void) -> (), self.surface, bo);
+                call!(self.gbm, "gbm_surface_release_buffer", fn(*mut c_void, *mut c_void) -> (), head.surface, bo);
                 return Err("could not make a framebuffer".into());
             }
-            if !self.set {
-                let mut connector = self.connector;
-                let mut mode = self.mode;
+            if !head.set {
+                let mut connector = head.connector;
+                let mut mode = head.mode;
                 let result = call!(
                     self.drm,
                     "drmModeSetCrtc",
                     fn(i32, u32, u32, u32, u32, *mut u32, i32, *mut DrmModeInfo) -> i32,
                     self.fd,
-                    self.crtc,
+                    head.crtc,
                     fb,
                     0,
                     0,
@@ -1549,15 +1652,15 @@ impl Kms {
                 if result != 0 {
                     return Err(format!("could not set the display mode, {result}"));
                 }
-                self.set = true;
-                self.shown = Some((bo, fb));
-            } else if call!(self.drm, "drmModePageFlip", fn(i32, u32, u32, u32, *mut c_void) -> i32, self.fd, self.crtc, fb, 1, std::ptr::null_mut()) == 0 {
+                head.set = true;
+                head.shown = Some((bo, fb));
+            } else if call!(self.drm, "drmModePageFlip", fn(i32, u32, u32, u32, *mut c_void) -> i32, self.fd, head.crtc, fb, 1, std::ptr::null_mut()) == 0 {
                 // a held picture says nothing of how early pictures come
                 self.asked = if paced { 0 } else { monotonic_micros() };
-                self.pending = Some((bo, fb));
+                head.pending = Some((bo, fb));
             } else {
                 call!(self.drm, "drmModeRmFB", fn(i32, u32) -> i32, self.fd, fb);
-                call!(self.gbm, "gbm_surface_release_buffer", fn(*mut c_void, *mut c_void) -> (), self.surface, bo);
+                call!(self.gbm, "gbm_surface_release_buffer", fn(*mut c_void, *mut c_void) -> (), head.surface, bo);
             }
         }
         Ok(())
@@ -1569,6 +1672,15 @@ impl Kms {
 /// 853x480 on a 16:9 one, 640x640 on a square one. A window that turns
 /// with the phone changes it. Width and height packed, 0 until set.
 static LAYOUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// whether the handheld drives two panels on its own, one screen on each.
+static SEPARATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// whether two panels each get a screen of their own, so the frontend can
+/// put the touch cursor on the lower one in its own coordinates.
+pub fn separate_displays() -> bool {
+    SEPARATE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 pub fn layout_size() -> (u32, u32) {
     match LAYOUT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1667,6 +1779,7 @@ impl Fit {
     }
 }
 
+#[derive(Clone)]
 enum Part {
     Cursor { x: i32, y: i32 },
     /// a screen's buffer, the top one's version when it is interpolated.
@@ -2077,160 +2190,238 @@ fn show(gl: GlRef, parts: Vec<Part>, frames: u32) -> Result<(), String> {
                 program
             }
         };
-        // SAFETY: on the GL thread, the window surface is current and every
-        // texture read is the size the uniforms say
-        unsafe {
-            let empty = match panel.empty {
-                Some(empty) => empty,
-                None => {
-                    let empty = gl.create_vertex_array()?;
-                    panel.empty = Some(empty);
-                    empty
-                }
-            };
-            if let Output::Window(_) = panel.output {
-                // the app away, or back with a new window
-                let wanted = WINDOW.load(std::sync::atomic::Ordering::Acquire);
-                if (wanted != WINDOW_IN_USE.load(std::sync::atomic::Ordering::Acquire) && !follow_window(panel.egl, wanted)) || wanted.is_null() {
-                    return Ok(());
+        // a handheld with two panels puts one screen on each by itself, so
+        // the frontend's areas give way to each panel's own
+        let heads = match &panel.output {
+            Output::Kms(kms) => kms.heads.len().min(2),
+            _ => 1,
+        };
+        let mut per_head: Vec<Vec<Part>> = Vec::with_capacity(heads);
+        if heads > 1 {
+            // each screen is placed in the layout's own coordinates, which
+            // the panel's fit then scales onto that panel
+            let size = zakuro_gpu_layout();
+            for head in 0..heads {
+                per_head.push(parts_for_head(&parts, head, size));
+            }
+            // let go of the buffers the flips replaced only once both panels
+            // have had their vertical blank
+            if let Output::Kms(kms) = &mut panel.output {
+                kms.settle()?;
+            }
+        } else {
+            per_head.push(parts);
+        }
+        for (head, parts) in per_head.into_iter().enumerate() {
+            if heads > 1 {
+                let surface = panel.egl.surface_alt.filter(|_| head == 1).unwrap_or_else(|| panel.egl.surface());
+                // SAFETY: EGL calls on the display and context this panel holds
+                let made = unsafe { panel.egl.egl.MakeCurrent(panel.egl.display, surface, surface, panel.egl.context) };
+                if made == 0 {
+                    return Err("could not make the second panel current".into());
                 }
             }
-            if let Output::Window(size) = &mut panel.output {
-                let (mut width, mut height) = (0, 0);
-                panel.egl.egl.QuerySurface(panel.egl.display, panel.egl.surface(), egl::WIDTH as i32, &mut width);
-                panel.egl.egl.QuerySurface(panel.egl.display, panel.egl.surface(), egl::HEIGHT as i32, &mut height);
-                if width > 0 && height > 0 && (width, height) != *size {
-                    log::info!("the window is {width}x{height} now");
-                    *size = (width, height);
-                    set_layout(*size);
-                }
-            }
-            let ((panel_width, panel_height), turn) = panel_shape(&panel.output);
-            let panel_framebuffer = match &panel.output {
-                Output::Offscreen(framebuffer) => Some(*framebuffer),
-                _ => None,
-            };
-            // a portrait panel under a landscape layout: everything is drawn
-            // into a canvas the panel's size on its side, which is turned
-            // onto the panel at the end
-            let (width, height, framebuffer) = match turn {
-                Some(_) => {
-                    let (canvas_width, canvas_height) = (panel_height, panel_width);
-                    let canvas = match panel.canvas {
-                        Some(canvas) if (canvas.width, canvas.height) == (canvas_width, canvas_height) => canvas,
-                        _ => {
-                            let texture = gl.create_texture()?;
-                            gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-                            gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, canvas_width, canvas_height);
-                            let framebuffer = gl.create_framebuffer()?;
-                            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
-                            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
-                            let program = link(&gl, PACK_VERTEX_SOURCE, ROTATE_SOURCE)?;
-                            let made = Canvas { texture, framebuffer, program, width: canvas_width, height: canvas_height };
-                            panel.canvas = Some(made);
-                            log::info!("drawing a {canvas_width}x{canvas_height} picture turned onto the {panel_width}x{panel_height} panel");
-                            made
-                        }
-                    };
-                    (canvas_width, canvas_height, Some(canvas.framebuffer))
-                }
-                None => (panel_width, panel_height, panel_framebuffer),
-            };
-            let layout = layout_size();
-            let layout = (layout.0 as i32, layout.1 as i32);
-            let fit = Fit::new(layout, (width, height));
-            gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
-            gl.viewport(0, 0, width, height);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::DEPTH_TEST);
-            gl.disable(glow::STENCIL_TEST);
-            gl.disable(glow::CULL_FACE);
-            gl.color_mask(true, true, true, true);
-            gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.use_program(Some(program));
-            let linear = match panel.linear {
-                Some(linear) => linear,
-                None => {
-                    let linear = gl.create_sampler()?;
-                    for (parameter, value) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
-                        gl.sampler_parameter_i32(linear, parameter, value as i32);
+            // SAFETY: on the GL thread, the window surface is current and every
+            // texture read is the size the uniforms say
+            unsafe {
+                let empty = match panel.empty {
+                    Some(empty) => empty,
+                    None => {
+                        let empty = gl.create_vertex_array()?;
+                        panel.empty = Some(empty);
+                        empty
                     }
-                    panel.linear = Some(linear);
-                    linear
-                }
-            };
-            gl.bind_vertex_array(Some(empty));
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_sampler(0, None);
-            gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
-            // the screen the second window shows, and the cursor when that is
-            // the bottom one, go there; the rest to the panel
-            let second = second_surface(panel);
-            let (parts, second_parts): (Vec<Part>, Vec<Part>) = match second {
-                Some(_) => {
-                    let top = SECOND_SHOWS_TOP.load(std::sync::atomic::Ordering::Relaxed);
-                    parts.into_iter().partition(|part| match part {
-                        Part::Surface { top: is_top, .. } => *is_top != top,
-                        Part::Pixels { index, .. } => (*index == 0) != top,
-                        Part::Cursor { .. } => top,
-                        Part::Overlay(_) => true,
-                    })
-                }
-                None => (parts, Vec::new()),
-            };
-            draw_parts(&gl, panel, program, linear, framebuffer, height, fit, layout, parts)?;
-            if let Output::Offscreen(_) = panel.output {
-                if let Some(path) = std::env::var_os("ZAKURO_PANEL_SHOT") {
-                    let mut data = vec![0u8; (width * height * 4) as usize];
-                    gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut data)));
-                    let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
-                    for row in data.chunks(width as usize * 4).rev() {
-                        ppm.extend(row.chunks(4).flat_map(|pixel| &pixel[..3]));
+                };
+                if let Output::Window(_) = panel.output {
+                    // the app away, or back with a new window
+                    let wanted = WINDOW.load(std::sync::atomic::Ordering::Acquire);
+                    if (wanted != WINDOW_IN_USE.load(std::sync::atomic::Ordering::Acquire) && !follow_window(panel.egl, wanted)) || wanted.is_null() {
+                        return Ok(());
                     }
-                    // a % in the name numbers each picture rather than keeping the last
-                    static SHOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    let path = path.to_string_lossy().replace('%', &format!("{:05}", SHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-                    let _ = std::fs::write(path, ppm);
                 }
-                return Ok(());
-            }
-            if let (Some(turn), Some(canvas)) = (turn, panel.canvas) {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-                gl.viewport(0, 0, panel_width, panel_height);
+                if let Output::Window(size) = &mut panel.output {
+                    let (mut width, mut height) = (0, 0);
+                    panel.egl.egl.QuerySurface(panel.egl.display, panel.egl.surface(), egl::WIDTH as i32, &mut width);
+                    panel.egl.egl.QuerySurface(panel.egl.display, panel.egl.surface(), egl::HEIGHT as i32, &mut height);
+                    if width > 0 && height > 0 && (width, height) != *size {
+                        log::info!("the window is {width}x{height} now");
+                        *size = (width, height);
+                        set_layout(*size);
+                    }
+                }
+                let ((panel_width, panel_height), turn) = match &panel.output {
+                    Output::Kms(kms) if heads > 1 => (kms.size_of(head), None),
+                    _ => panel_shape(&panel.output),
+                };
+                let panel_framebuffer = match &panel.output {
+                    Output::Offscreen(framebuffer) => Some(*framebuffer),
+                    _ => None,
+                };
+                // a portrait panel under a landscape layout: everything is drawn
+                // into a canvas the panel's size on its side, which is turned
+                // onto the panel at the end
+                let (width, height, framebuffer) = match turn {
+                    Some(_) => {
+                        let (canvas_width, canvas_height) = (panel_height, panel_width);
+                        let canvas = match panel.canvas {
+                            Some(canvas) if (canvas.width, canvas.height) == (canvas_width, canvas_height) => canvas,
+                            _ => {
+                                let texture = gl.create_texture()?;
+                                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                                gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, canvas_width, canvas_height);
+                                let framebuffer = gl.create_framebuffer()?;
+                                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+                                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(texture), 0);
+                                let program = link(&gl, PACK_VERTEX_SOURCE, ROTATE_SOURCE)?;
+                                let made = Canvas { texture, framebuffer, program, width: canvas_width, height: canvas_height };
+                                panel.canvas = Some(made);
+                                log::info!("drawing a {canvas_width}x{canvas_height} picture turned onto the {panel_width}x{panel_height} panel");
+                                made
+                            }
+                        };
+                        (canvas_width, canvas_height, Some(canvas.framebuffer))
+                    }
+                    None => (panel_width, panel_height, panel_framebuffer),
+                };
+                let layout = layout_size();
+                let layout = (layout.0 as i32, layout.1 as i32);
+                let fit = Fit::new(layout, (width, height));
+                gl.bind_framebuffer(glow::FRAMEBUFFER, framebuffer);
+                gl.viewport(0, 0, width, height);
                 gl.disable(glow::SCISSOR_TEST);
                 gl.disable(glow::BLEND);
+                gl.disable(glow::DEPTH_TEST);
+                gl.disable(glow::STENCIL_TEST);
+                gl.disable(glow::CULL_FACE);
                 gl.color_mask(true, true, true, true);
                 gl.clear_color(0.0, 0.0, 0.0, 1.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
-                // the canvas on its side, fitted to the panel and centred
-                let (turned_width, turned_height) = (canvas.height as f32, canvas.width as f32);
-                let scale = (panel_width as f32 / turned_width).min(panel_height as f32 / turned_height);
-                let (rect_width, rect_height) = (turned_width * scale, turned_height * scale);
-                let (left, bottom) = ((panel_width as f32 - rect_width) / 2.0, (panel_height as f32 - rect_height) / 2.0);
-                gl.use_program(Some(canvas.program));
-                gl.uniform_1_i32(gl.get_uniform_location(canvas.program, "canvas").as_ref(), 0);
-                gl.uniform_1_i32(gl.get_uniform_location(canvas.program, "turn").as_ref(), turn);
-                gl.uniform_4_f32(gl.get_uniform_location(canvas.program, "rect").as_ref(), left, bottom, rect_width, rect_height);
+                gl.use_program(Some(program));
+                let linear = match panel.linear {
+                    Some(linear) => linear,
+                    None => {
+                        let linear = gl.create_sampler()?;
+                        for (parameter, value) in [(glow::TEXTURE_MIN_FILTER, glow::LINEAR), (glow::TEXTURE_MAG_FILTER, glow::LINEAR), (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE), (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE)] {
+                            gl.sampler_parameter_i32(linear, parameter, value as i32);
+                        }
+                        panel.linear = Some(linear);
+                        linear
+                    }
+                };
                 gl.bind_vertex_array(Some(empty));
                 gl.active_texture(glow::TEXTURE0);
-                gl.bind_sampler(0, Some(linear));
-                gl.bind_texture(glow::TEXTURE_2D, Some(canvas.texture));
-                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                gl.bind_sampler(0, None);
+                gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
+                // the screen the second window shows, and the cursor when that is
+                // the bottom one, go there; the rest to the panel
+                let second = second_surface(panel);
+                let (parts, second_parts): (Vec<Part>, Vec<Part>) = match second {
+                    Some(_) => {
+                        let top = SECOND_SHOWS_TOP.load(std::sync::atomic::Ordering::Relaxed);
+                        parts.into_iter().partition(|part| match part {
+                            Part::Surface { top: is_top, .. } => *is_top != top,
+                            Part::Pixels { index, .. } => (*index == 0) != top,
+                            Part::Cursor { .. } => top,
+                            Part::Overlay(_) => true,
+                        })
+                    }
+                    None => (parts, Vec::new()),
+                };
+                draw_parts(&gl, panel, program, linear, framebuffer, height, fit, layout, parts)?;
+                if let Output::Offscreen(_) = panel.output {
+                    if let Some(path) = std::env::var_os("ZAKURO_PANEL_SHOT") {
+                        let mut data = vec![0u8; (width * height * 4) as usize];
+                        gl.read_pixels(0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut data)));
+                        let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
+                        for row in data.chunks(width as usize * 4).rev() {
+                            ppm.extend(row.chunks(4).flat_map(|pixel| &pixel[..3]));
+                        }
+                        // a % in the name numbers each picture rather than keeping the last
+                        static SHOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        let path = path.to_string_lossy().replace('%', &format!("{:05}", SHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+                        let _ = std::fs::write(path, ppm);
+                    }
+                    return Ok(());
+                }
+                if let (Some(turn), Some(canvas)) = (turn, panel.canvas) {
+                    gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    gl.viewport(0, 0, panel_width, panel_height);
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.disable(glow::BLEND);
+                    gl.color_mask(true, true, true, true);
+                    gl.clear_color(0.0, 0.0, 0.0, 1.0);
+                    gl.clear(glow::COLOR_BUFFER_BIT);
+                    // the canvas on its side, fitted to the panel and centred
+                    let (turned_width, turned_height) = (canvas.height as f32, canvas.width as f32);
+                    let scale = (panel_width as f32 / turned_width).min(panel_height as f32 / turned_height);
+                    let (rect_width, rect_height) = (turned_width * scale, turned_height * scale);
+                    let (left, bottom) = ((panel_width as f32 - rect_width) / 2.0, (panel_height as f32 - rect_height) / 2.0);
+                    gl.use_program(Some(canvas.program));
+                    gl.uniform_1_i32(gl.get_uniform_location(canvas.program, "canvas").as_ref(), 0);
+                    gl.uniform_1_i32(gl.get_uniform_location(canvas.program, "turn").as_ref(), turn);
+                    gl.uniform_4_f32(gl.get_uniform_location(canvas.program, "rect").as_ref(), left, bottom, rect_width, rect_height);
+                    gl.bind_vertex_array(Some(empty));
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_sampler(0, Some(linear));
+                    gl.bind_texture(glow::TEXTURE_2D, Some(canvas.texture));
+                    gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                }
+                if panel.egl.egl.SwapBuffers(panel.egl.display, panel.egl.surface()) == 0 {
+                    return Err("could not swap the panel's buffers".into());
+                }
+                if let Some((surface, size)) = second {
+                    draw_second(&gl, panel, program, linear, empty, surface, size, second_parts)?;
+                }
             }
-            if panel.egl.egl.SwapBuffers(panel.egl.display, panel.egl.surface()) == 0 {
-                return Err("could not swap the panel's buffers".into());
-            }
-            if let Some((surface, size)) = second {
-                draw_second(&gl, panel, program, linear, empty, surface, size, second_parts)?;
+
+            if let Output::Kms(kms) = &mut panel.output {
+                kms.flip(head, frames)?;
             }
         }
-        match &mut panel.output {
-            Output::Kms(kms) => kms.flip(frames),
-            Output::Fbdev(_) | Output::Window(_) | Output::Offscreen(_) => Ok(()),
-        }
+        Ok(())
     })
+}
+
+/// the layout's size, as the screens are placed in it.
+fn zakuro_gpu_layout() -> (i32, i32) {
+    let (width, height) = layout_size();
+    (width as i32, height as i32)
+}
+
+/// the parts that go on one panel of a handheld with two: the top screen on
+/// the first panel, the bottom one on the second, each kept in shape and
+/// centred, the menu on the first and the touch cursor on the second.
+fn parts_for_head(parts: &[Part], head: usize, size: (i32, i32)) -> Vec<Part> {
+    let mut out = Vec::new();
+    for part in parts {
+        match part {
+            Part::Surface { texture, screen, smooth, top, picture, .. } => {
+                if *top != (head == 0) {
+                    continue;
+                }
+                let area = fit_on(size, screen[0].max(1), screen[1].max(1));
+                out.push(Part::Surface { texture: *texture, screen: *screen, area, smooth: *smooth, top: *top, picture: *picture });
+            }
+            Part::Pixels { index, pixels, width, height, smooth, .. } => {
+                if *index != head {
+                    continue;
+                }
+                let area = fit_on(size, *width as i32, *height as i32);
+                out.push(Part::Pixels { index: *index, pixels: pixels.clone(), width: *width, height: *height, area, smooth: *smooth });
+            }
+            Part::Overlay(overlay) if head == 0 => out.push(Part::Overlay(overlay.clone())),
+            Part::Cursor { x, y } if head == 1 => out.push(Part::Cursor { x: *x, y: *y }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// a screen fitted into a panel of this size, keeping its shape.
+fn fit_on((width, height): (i32, i32), screen_width: i32, screen_height: i32) -> [i32; 4] {
+    let scale = (width as f32 / screen_width as f32).min(height as f32 / screen_height as f32);
+    let (w, h) = ((screen_width as f32 * scale).round() as i32, (screen_height as f32 * scale).round() as i32);
+    [(width - w) / 2, (height - h) / 2, w, h]
 }
 
 /// where the panel's picture goes: the handheld's screen, or for working on
@@ -2277,6 +2468,8 @@ struct Egl {
     /// the panel's surface, which an activity's window going and coming
     /// back changes.
     surface: std::sync::atomic::AtomicPtr<c_void>,
+    /// the second panel's surface, on a handheld with two.
+    surface_alt: Option<egl::types::EGLSurface>,
 }
 
 // SAFETY: EGL's entry points can be called from any thread, and the handles
@@ -2427,7 +2620,7 @@ impl Egl {
                 let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
                 remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
             });
-            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void) }, gl))
+            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None }, gl))
         }
     }
 
@@ -2482,7 +2675,15 @@ impl Egl {
                     visual as u32 == GBM_FORMAT_XRGB8888
                 })
                 .ok_or("no EGL config for the panel")?;
-            let (egl, gl) = Egl::on_window((library, gles), loaded, display, config, kms.surface as glutin_egl_sys::EGLNativeWindowType, 0)?;
+            let (mut egl, gl) = Egl::on_window((library, gles), loaded, display, config, kms.heads[0].surface as glutin_egl_sys::EGLNativeWindowType, 0)?;
+            if kms.heads.len() > 1 {
+                let alt = egl.egl.CreateWindowSurface(egl.display, egl.config, kms.heads[1].surface as glutin_egl_sys::EGLNativeWindowType, std::ptr::null());
+                if alt.is_null() {
+                    return Err(format!("could not make the second panel's surface, 0x{:X}", egl.egl.GetError()));
+                }
+                egl.surface_alt = Some(alt);
+                egl.egl.MakeCurrent(egl.display, egl.surface(), egl.surface(), egl.context);
+            }
             Ok((egl, gl, kms))
         }
     }
@@ -2625,7 +2826,7 @@ impl Egl {
             let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
             remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
         });
-        Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void) }, gl))
+        Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None }, gl))
     }
 
     /// a context sharing this one's objects, made current on the calling
@@ -3675,6 +3876,9 @@ impl Worker {
                     };
                     if let Some(output) = output {
                         let ((width, height), turn) = panel_shape(&output);
+                        if let Output::Kms(kms) = &output {
+                            SEPARATE.store(kms.heads.len() > 1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         set_layout(if turn.is_some() { (height, width) } else { (width, height) });
                         PANEL.with(|screen| *screen.borrow_mut() = Some(Panel { egl, output, program: None, textures: [None, None], empty: None, linear: None, overlay: None, overlay_textures: HashMap::new(), between: Between::default(), canvas: None, second: None }));
                     }
@@ -5099,6 +5303,13 @@ impl Gles {
         }
         let fragment = if debug == "trivial" {
             "#version 310 es\nprecision highp float;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 0) out vec4 out_color;\nvoid main() { out_color = clamp(in_color, 0.0, 1.0); }\n".to_owned()
+        } else if debug == "simple" {
+            // vertex colors times the textures, in place of the full
+            // combiner: the Mali-G52 of the RG DS Plus draws this at the
+            // title's own rate where the combiner leaves it blue or slow
+            let config = debug_constants[25];
+            let (u0, u1, u2) = (config & 1 != 0, config & 2 != 0, config & 4 != 0);
+            format!("#version 310 es\nprecision highp float;\nprecision highp sampler2D;\nuniform sampler2D texture0;\nuniform sampler2D texture1;\nuniform sampler2D texture2;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 1) in vec4 in_texcoords01;\nlayout(location = 2) in vec2 in_texcoord2;\nlayout(location = 0) out vec4 out_color;\nconst bool U0 = {};\nconst bool U1 = {};\nconst bool U2 = {};\nvoid main() {{\n    vec4 c = in_color;\n    vec4 t = vec4(1.0);\n    if (U0) t *= texture(texture0, vec2(in_texcoords01.x, 1.0 - in_texcoords01.y));\n    if (U1) t *= texture(texture1, vec2(in_texcoords01.z, 1.0 - in_texcoords01.w));\n    if (U2) t *= texture(texture2, vec2(in_texcoord2.x, 1.0 - in_texcoord2.y));\n    if (t.a < 0.01 && (U0 || U1 || U2)) discard;\n    vec4 result = clamp(c * t, 0.0, 1.0);\n    if ((U0 || U1 || U2) && result.r < 0.004 && result.g < 0.004 && result.b < 0.004) discard;\n    out_color = result;\n}}\n", u0, u1, u2)
         } else {
             fragment_source(&debug_constants, writes_depth, lighting)
         };

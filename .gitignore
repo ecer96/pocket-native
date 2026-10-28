@@ -12,3 +12,4 @@ aes_keys.txt
 .DS_Store
 .old/
 .update/
+build-pc/

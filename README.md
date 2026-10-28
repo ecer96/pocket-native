@@ -43,7 +43,8 @@ by fearkov. On top of them it adds:
 
 - an OpenGL ES 3.1 renderer, tuned for Mali GPUs with no Vulkan driver
 - a frontend for handhelds with no desktop: KMS or the framebuffer for
-  the screens, evdev for the buttons, ALSA for sound
+  the screens, evdev for the buttons, ALSA for sound, and a window on a
+  Linux desktop when there is one, see [docs/desktop.md](docs/desktop.md)
 - an in-game menu for layouts, frame cap, power, controls and per-game
   settings
 - per-game profiles in `titles/`, and a probe mode for trying games
@@ -75,6 +76,7 @@ working or not.
 | Anbernic RG351P | ArkOS | Buttons not found yet |
 | AYN Thor | Android | Works, both screens |
 | Anbernic RG DS | Android | Works, both screens |
+| Anbernic RG DS Plus | Anbernic's Linux | Both panels, one screen each, buttons and touch found |
 | Anbernic RG DS | Anbernic's Linux | Not yet: one screen only, buttons not found |
 | Android phones | Android 11 or newer, 64-bit | Works, with touch controls or a gamepad |
 | AmberELEC, Rocknix | | Not yet |

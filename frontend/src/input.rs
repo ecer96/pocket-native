@@ -63,6 +63,73 @@ pub struct Pad {
     pub second_touch: Option<(f32, f32)>,
 }
 
+/// the lower panel's touchscreen, in the console's 320x240.
+#[derive(Default)]
+pub struct Touch {
+    pub down: bool,
+    pub x: f32,
+    pub y: f32,
+}
+
+/// the handheld's touch panel, when it has one evdev can read: the RG DS
+/// Plus's Goodix gt9xx.
+pub fn touchscreen() -> Option<(String, String)> {
+    let devices = std::fs::read_to_string("/proc/bus/input/devices").ok()?;
+    devices.split("\n\n").find_map(|block| {
+        let name = block.lines().find_map(|line| line.strip_prefix("N: Name="))?.trim_matches('"');
+        if !name.starts_with("gt9xx") {
+            return None;
+        }
+        let handlers = block.lines().find_map(|line| line.strip_prefix("H: Handlers="))?;
+        let event = handlers.split_whitespace().find(|handler| handler.starts_with("event"))?;
+        Some((format!("/dev/input/{event}"), name.to_owned()))
+    })
+}
+
+/// reads where the finger is on the touch panel. The gt9xx driver on the RG
+/// DS Plus sends no BTN_TOUCH: a tracking id of 0 or more is a touch down,
+/// -1 the finger lifted.
+pub fn read_touch(path: String, name: String, touch: Arc<Mutex<Touch>>) {
+    std::thread::spawn(move || {
+        let Ok(mut device) = std::fs::File::open(&path) else {
+            log::error!("could not open {path}");
+            return;
+        };
+        let mut range = |axis: libc::c_ulong| {
+            let mut info = [0i32; 6];
+            // SAFETY: EVIOCGABS fills the input_absinfo of the axis asked for
+            let read = unsafe { libc::ioctl(device.as_raw_fd(), (0x8018_4540 + axis) as _, info.as_mut_ptr()) };
+            (read >= 0 && info[2] > info[1]).then_some((info[1], info[2]))
+        };
+        let xr = range(0x35).or_else(|| range(0x00));
+        let yr = range(0x36).or_else(|| range(0x01));
+        let mut raw = (0i32, 0i32);
+        let mut tracking = false;
+        let mut event = [0u8; 24];
+        log::info!("touch from {name}");
+        while device.read_exact(&mut event).is_ok() {
+            let kind = u16::from_ne_bytes([event[16], event[17]]);
+            let code = u16::from_ne_bytes([event[18], event[19]]);
+            let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
+            match kind {
+                3 if code == 0x35 => raw.0 = value,
+                3 if code == 0x36 => raw.1 = value,
+                3 if code == 0x00 => raw.0 = value,
+                3 if code == 0x01 => raw.1 = value,
+                3 if code == 0x39 => tracking = value >= 0,
+                1 if code == 0x14a || code == 0x145 => tracking = value != 0,
+                _ => continue,
+            }
+            let across = xr.map_or(0.0, |(least, most)| (raw.0 - least) as f32 / (most - least).max(1) as f32).clamp(0.0, 1.0);
+            let down = yr.map_or(0.0, |(least, most)| (raw.1 - least) as f32 / (most - least).max(1) as f32).clamp(0.0, 1.0);
+            let mut touch = touch.lock().unwrap();
+            touch.down = tracking;
+            touch.x = across * 319.0;
+            touch.y = down * 239.0;
+        }
+    });
+}
+
 /// the pad a program around the frontend fills, in place of evdev's.
 static SHARED: std::sync::OnceLock<Arc<Mutex<Pad>>> = std::sync::OnceLock::new();
 
@@ -94,7 +161,7 @@ pub fn gamepad() -> Option<(String, String)> {
     blocks.into_iter().find_map(|block| {
         // the name comes in quotes
         let name = block.lines().find_map(|line| line.strip_prefix("N: Name="))?.trim_matches('"');
-        if !name.contains("Gamepad") && !name.contains("Controller") && !name.contains("Joypad") && !name.contains("joypad") && !h700_pad(name) && !rk3562_pad(name) && name != "muOS-Keys" {
+        if !name.contains("Gamepad") && !name.contains("Controller") && !name.contains("Joypad") && !name.contains("joypad") && !h700_pad(name) && !rk3562_pad(name) && !rk3568_pad(name) && name != "muOS-Keys" {
             return None;
         }
         let handlers = block.lines().find_map(|line| line.strip_prefix("H: Handlers="))?;
@@ -116,6 +183,12 @@ fn rk3562_pad(name: &str) -> bool {
     name.trim_matches('"') == "rk3562-joystick"
 }
 
+/// the RG DS Plus's pad: the RK3568 button driver, its face buttons where
+/// the R36S has them and its sticks on ABS_Z/ABS_RX and ABS_RY/ABS_RZ.
+fn rk3568_pad(name: &str) -> bool {
+    name.trim_matches('"') == "ANBERNIC-rk3568-keys"
+}
+
 pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     // muOS calls its pad muOS-Keys: on its release the kernel's, numbered as
     // on the H700 handhelds, and from the next one a pad muOS makes itself,
@@ -131,6 +204,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
     // the RK3562 handhelds give them the usual numbers too, with the
     // sticks on the usual axes
     let rk3562 = rk3562_pad(&name);
+    let rk3568 = rk3568_pad(&name);
     log::info!(
         "buttons from {name}{}",
         if h700 {
@@ -139,6 +213,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             ", numbered as on Anbernic's RK3566 handhelds"
         } else if rk3562 {
             ", numbered as on the RK3562 handhelds"
+        } else if rk3568 {
+            ", numbered as on the RG DS Plus (RK3568)"
         } else if muos {
             ", numbered as on muOS"
         } else {
@@ -151,7 +227,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if rk3566 {
         Some([Some(0), Some(1), Some(3), None, None, Some(4)])
-    } else if rk3562 || muos {
+    } else if rk3562 || rk3568 || muos {
         // left stick on ABS_X and ABS_Y, right on ABS_RX and ABS_RY, the
         // triggers on ABS_Z and ABS_RZ, which are buttons here
         Some([Some(0), Some(1), None, Some(3), Some(4), None])
@@ -188,6 +264,8 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         rk3566_button(code)
                     } else if rk3562 {
                         rk3562_button(code)
+                    } else if rk3568 {
+                        rk3568_button(code)
                     } else if muos {
                         muos_button(code)
                     } else {
@@ -199,7 +277,7 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
                         pad.keys.insert(code);
                     }
                 }
-                (3, _) if (h700 || muos) && matches!(code, 16 | 17) => {
+                (3, _) if (h700 || rk3568 || muos) && matches!(code, 16 | 17) => {
                     let (less, more) = if code == 16 { (LEFT, RIGHT) } else { (UP, DOWN) };
                     pad.keys.remove(&less);
                     pad.keys.remove(&more);
@@ -267,6 +345,17 @@ fn rk3562_button(code: u16) -> u16 {
         317 => L3,
         318 => R3,
         704 => FN,
+        other => other,
+    }
+}
+
+/// the RG DS Plus's buttons: its kernel reports the extra left and right
+/// buttons as BTN_C and BTN_Z, which stand in for Y, and BTN_MODE as FN.
+fn rk3568_button(code: u16) -> u16 {
+    match code {
+        306 | 309 => Y,
+        316 => FN,
+        354 => FN,
         other => other,
     }
 }

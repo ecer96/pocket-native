@@ -53,7 +53,7 @@ user=(--user "$(id -u):$(id -g)")
 [ "$(basename "$engine")" = podman ] && user=(--userns=keep-id)
 failed=()
 for rom in "${roms[@]}"; do
-    mounts=(-v "$repo:/src:ro" -v "$out/.work:/work" -v "$out:/out" -v "$(dirname "$rom"):/rom:ro")
+    mounts=(-v "$repo:/src:ro,z" -v "$out/.work:/work:z" -v "$out:/out:z" -v "$(dirname "$rom"):/rom:ro,z")
     args=("/rom/$(basename "$rom")")
     # a .cia takes the keys given, else the aes_keys.txt beside it or in the
     # kit, else the one picked when asked
@@ -68,7 +68,7 @@ for rom in "${roms[@]}"; do
         fi
     fi
     if [ -n "$rom_keys" ]; then
-        mounts+=(-v "$(dirname "$rom_keys"):/keys:ro")
+        mounts+=(-v "$(dirname "$rom_keys"):/keys:ro,z")
         args+=("/keys/$(basename "$rom_keys")")
     fi
     "$engine" run --rm "${user[@]}" "${mounts[@]}" -e CARGO_HOME=/work/cargo -e CARGO_TARGET_DIR=/work/target -e HOME=/work \

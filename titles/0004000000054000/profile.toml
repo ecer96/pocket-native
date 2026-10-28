@@ -1,1 +1,7 @@
 name = "Super Mario 3D Land"
+
+# Super Mario 3D Land draws with the simplified fragment path on the Mali-G52
+# of the RG DS Plus: the full combiner leaves the screen blue there, and this
+# one keeps the title at its own frame rate. Other GPUs keep the combiner.
+[advanced]
+gpu_drawing = true

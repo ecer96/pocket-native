@@ -28,6 +28,7 @@ mod readahead;
 mod settings;
 mod sound;
 mod touch;
+mod window;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -152,6 +153,9 @@ pub fn run(mut args: Vec<String>) {
         clock: std::env::var("ZAKURO_CLOCK").ok().and_then(|v| v.parse().ok()),
         ..Config::default()
     };
+    // a computer's window in place of the handheld's panel, with its keyboard
+    // and mouse for the pad
+    let _desktop = if probing { None } else { window::Desktop::open() };
     let mut system = match loader::load(&path, config) {
         Ok(system) => system,
         Err(error) => {
@@ -184,6 +188,15 @@ pub fn run(mut args: Vec<String>) {
             pad
         }
     };
+    // a panel under the fingers, the RG DS Plus's, in place of the pad's
+    // cursor
+    let touch_input = Arc::new(Mutex::new(input::Touch::default()));
+    if input::shared().is_none() && std::env::var_os("ZAKURO_INPUT").is_none() && probe.is_none() {
+        match input::touchscreen() {
+            Some((device, name)) => input::read_touch(device, name, touch_input.clone()),
+            None => {}
+        }
+    }
     let (sound, samples) = mpsc::channel();
     sound::play(samples);
 
@@ -451,6 +464,15 @@ pub fn run(mut args: Vec<String>) {
             cursor.1 = (cursor.1 + (y + down).clamp(-1.0, 1.0) * step).clamp(0.0, 239.0);
         }
         let mut touching = !c_stick && keys.contains(&R2);
+        // a finger on the panel touches there
+        let (touch_down, touch_x, touch_y) = {
+            let touch = touch_input.lock().unwrap();
+            (touch.down, touch.x, touch.y)
+        };
+        if touch_down {
+            cursor = (touch_x, touch_y);
+            touching = true;
+        }
         // a finger on the bottom screen where it is shown touches there, and
         // moves the cursor along: on the panel, unless the bottom screen is on
         // a second window by itself, or there
@@ -563,7 +585,14 @@ pub fn run(mut args: Vec<String>) {
                 }
             }
             let areas = layout::shown(&settings);
-            let pointer = areas[1].map(|[x, y, width, height]| (x + (cursor.0 * width as f32 / 320.0) as i32, y + (cursor.1 * height as f32 / 240.0) as i32));
+            // with a screen on each panel, the cursor goes on the lower one
+            // in its own coordinates
+            let pointer = if zakuro_gpu::separate_displays() {
+                let (across, down) = zakuro_gpu::layout_size();
+                Some(((cursor.0 * across as f32 / 320.0) as i32, (cursor.1 * down as f32 / 240.0) as i32))
+            } else {
+                areas[1].map(|[x, y, width, height]| (x + (cursor.0 * width as f32 / 320.0) as i32, y + (cursor.1 * height as f32 / 240.0) as i32))
+            };
             system.present_panel(areas, pointer, overlays(&overlay, &controls_overlay), settings.smooth, interpolating);
         }
 
