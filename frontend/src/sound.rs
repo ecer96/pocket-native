@@ -3,6 +3,7 @@
 //! the frame rate, counting all of it not yet heard, and leaving some out to
 //! catch up at once when it falls far behind.
 
+use std::ffi::CString;
 use std::sync::mpsc;
 
 use zakuro_core::AUDIO_SAMPLE_RATE;
@@ -156,8 +157,13 @@ impl Alsa {
             let write = *alsa.get::<unsafe extern "C" fn(*mut u8, *const u8, u64) -> i64>(b"snd_pcm_writei\0").ok()?;
             let recover = *alsa.get::<unsafe extern "C" fn(*mut u8, i32, i32) -> i32>(b"snd_pcm_recover\0").ok()?;
             let delay = *alsa.get::<unsafe extern "C" fn(*mut u8, *mut i64) -> i32>(b"snd_pcm_delay\0").ok()?;
+            // ZAKURO_ALSA_DEVICE names another device than the system's
+            // default, as a handheld whose speaker is on its second card
+            // needs
+            let device = std::env::var("ZAKURO_ALSA_DEVICE").unwrap_or_else(|_| "default".to_owned());
+            let device = CString::new(device).ok()?;
             let mut pcm = std::ptr::null_mut();
-            if open(&mut pcm, b"default\0".as_ptr(), 0, 0) < 0 || set(pcm, 2, 3, 2, AUDIO_SAMPLE_RATE.round() as u32, 1, 150_000) < 0 {
+            if open(&mut pcm, device.as_ptr() as *const u8, 0, 0) < 0 || set(pcm, 2, 3, 2, AUDIO_SAMPLE_RATE.round() as u32, 1, 150_000) < 0 {
                 log::warn!("could not open the sound device, playing without sound");
                 return None;
             }

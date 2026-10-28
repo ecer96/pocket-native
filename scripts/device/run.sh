@@ -15,6 +15,11 @@ export POCKET_NATIVE_TITLES="$dir/titles" POCKET_NATIVE_POWER="$dir/power.sh" PO
 # of the RG DS Plus: the full combiner leaves its screen blue there and the
 # simple one keeps it at the title's own rate. Other titles are untouched.
 [ "$1" = "0004000000054000" ] && export ZAKURO_FS_DEBUG=simplemulti
+# GeminusOS's speaker is the amplifier on the second card, not the codec on
+# the first, which is the system's default
+if [ -z "${ZAKURO_ALSA_DEVICE:-}" ] && [ -x /etc/init.d/S49weston ] && [ -d /proc/asound/card1 ]; then
+    export ZAKURO_ALSA_DEVICE=plughw:1,0
+fi
 # draws to leave out besides the game's options, as ZAKURO_DROP_DRAWS takes them
 [ -f "$data/drops.txt" ] && export ZAKURO_DROP_DRAWS="$(cat "$data/drops.txt")"
 
