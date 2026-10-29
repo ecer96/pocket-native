@@ -5,8 +5,37 @@
 
 use std::ffi::CString;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use zakuro_core::AUDIO_SAMPLE_RATE;
+
+/// the sound's volume in percent, from the handheld's volume buttons, for a
+/// device whose mixer has none, as the RG DS Plus's amplifier does not:
+/// u32::MAX until read from the volume file in the configuration folder.
+static VOLUME: AtomicU32 = AtomicU32::new(u32::MAX);
+
+fn volume_file() -> std::path::PathBuf {
+    crate::settings::config_dir().join("volume")
+}
+
+/// the volume in percent, as last left.
+pub fn volume() -> u32 {
+    let volume = VOLUME.load(Ordering::Relaxed);
+    if volume != u32::MAX {
+        return volume;
+    }
+    let read = std::fs::read_to_string(volume_file()).ok().and_then(|text| text.trim().parse::<u32>().ok()).unwrap_or(100).min(100);
+    VOLUME.store(read, Ordering::Relaxed);
+    read
+}
+
+/// the volume a step of 5 up or down, kept for the next run.
+pub fn step_volume(up: bool) {
+    let volume = if up { (volume() + 5).min(100) } else { volume().saturating_sub(5) };
+    VOLUME.store(volume, Ordering::Relaxed);
+    let _ = std::fs::write(volume_file(), format!("{volume}\n"));
+    log::info!("volume {volume}%");
+}
 
 /// where the sound goes: how many frames it holds that have not played yet,
 /// and taking more, all of them before it returns.
@@ -201,6 +230,14 @@ impl Device for Alsa {
     }
 
     fn write(&mut self, frames: &[[i16; 2]]) {
+        let scaled: Vec<[i16; 2]>;
+        let volume = volume();
+        let frames = if volume < 100 {
+            scaled = frames.iter().map(|frame| frame.map(|sample| (sample as i32 * volume as i32 / 100) as i16)).collect();
+            &scaled[..]
+        } else {
+            frames
+        };
         let mut done = 0;
         while done < frames.len() {
             // SAFETY: the frames left, interleaved stereo as the device was set up

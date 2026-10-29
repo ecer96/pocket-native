@@ -25,6 +25,7 @@ mod probe;
 mod profile;
 mod profiler;
 mod readahead;
+mod sdl;
 mod settings;
 mod sound;
 mod touch;
@@ -155,7 +156,10 @@ pub fn run(mut args: Vec<String>) {
     };
     // a computer's window in place of the handheld's panel, with its keyboard
     // and mouse for the pad
-    let _desktop = if probing { None } else { window::Desktop::open() };
+    // a system whose desktop is Wayland, as the RG DS Plus's is, gets an SDL
+    // window; on X11 the window is the engine's own
+    let _sdl = if probing || std::env::var_os("ZAKURO_SDL").is_none() { None } else { sdl::Sdl::open() };
+    let _desktop = if probing || _sdl.is_some() { None } else { window::Desktop::open() };
     let mut system = match loader::load(&path, config) {
         Ok(system) => system,
         Err(error) => {

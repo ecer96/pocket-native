@@ -54,6 +54,15 @@ const ADRENO_COMPARE: &str = "    if (function < 2u) {
     }
     return value > reference || (function == 7u && value == reference);";
 static ADRENO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// a Mali on ARM's own driver, which reads one draw's uniform block for
+/// another's and runs compute shaders out of order with the draws around
+/// them: small blocks of their own, lean programs and screens copied by
+/// drawing go around it.
+static MALI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Panfrost, Mesa's driver for the Mali GPUs, whose compiler takes long over
+/// the full combiner: draws get the lean programs the Mali paths make, but
+/// none of what ARM's driver needed for its order.
+static PANFROST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const VERTEX_SOURCE: &str = r#"#version 310 es
 layout(location = 0) in vec4 position;
@@ -1071,6 +1080,267 @@ fn fragment_source(constants: &[u32; FRAGMENT_CONSTANTS], writes_depth: bool, li
     if ADRENO.load(std::sync::atomic::Ordering::Relaxed) {
         out = out.replace(SWITCH_COMPARE, ADRENO_COMPARE);
     }
+    static STRAIGHT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if MALI.load(std::sync::atomic::Ordering::Relaxed) || PANFROST.load(std::sync::atomic::Ordering::Relaxed) || *STRAIGHT.get_or_init(|| std::env::var_os("ZAKURO_STRAIGHT_COMBINERS").is_some()) {
+        if let Some(lean) = lean_fragment(&out, writes_depth) {
+            return lean;
+        }
+        out = straight_combiners(&out);
+    }
+    out
+}
+
+/// the six combiner stages written out as plain lines for the pipeline's
+/// own registers, in place of the calls into the switches: the Mali-G52's
+/// compiler takes minutes over those and draws some stages wrong, the RG DS
+/// Plus's title screen and layouts going missing. the generic pipeline, which
+/// reads its registers as it runs, keeps the calls
+fn combiner_code(source: &str) -> Option<String> {
+    let constant = |name: &str| -> Option<u32> {
+        let line = source.lines().find(|line| line.starts_with(&format!("const uint {name} = ")))?;
+        line.rsplit(' ').next()?.trim_end_matches(';').trim_end_matches('u').parse().ok()
+    };
+    if constant("DYNAMIC") != Some(0) {
+        return None;
+    }
+    let Some(update) = constant("UPDATE").map(|update| update & 0xFF00) else {
+        return None;
+    };
+    let value = |s: u32| match s {
+        0x0 => "primary".to_owned(),
+        0x1 => "fragment_primary".to_owned(),
+        0x2 => "fragment_secondary".to_owned(),
+        0x3..=0x6 => format!("textures[{}]", s - 3),
+        0xD => "held".to_owned(),
+        0xE => "k".to_owned(),
+        _ => "previous".to_owned(),
+    };
+    let color = |s: String, operand: u32| match operand {
+        0x1 => format!("(vec3(1.0) - {s}.rgb)"),
+        0x2 => format!("vec3({s}.a)"),
+        0x3 => format!("vec3(1.0 - {s}.a)"),
+        0x4 => format!("vec3({s}.r)"),
+        0x5 => format!("vec3(1.0 - {s}.r)"),
+        0x8 => format!("vec3({s}.g)"),
+        0x9 => format!("vec3(1.0 - {s}.g)"),
+        0xC => format!("vec3({s}.b)"),
+        0xD => format!("vec3(1.0 - {s}.b)"),
+        _ => format!("{s}.rgb"),
+    };
+    let alpha = |s: String, operand: u32| match operand {
+        0x0 => format!("{s}.a"),
+        0x1 => format!("(1.0 - {s}.a)"),
+        0x2 => format!("{s}.r"),
+        0x3 => format!("(1.0 - {s}.r)"),
+        0x4 => format!("{s}.g"),
+        0x5 => format!("(1.0 - {s}.g)"),
+        0x6 => format!("{s}.b"),
+        _ => format!("(1.0 - {s}.b)"),
+    };
+    let mut code = String::new();
+    for stage in 0..6u32 {
+        let (Some(sources), Some(operand), Some(combiner), Some(scale)) = (
+            constant(&format!("SOURCE{stage}")),
+            constant(&format!("OPERAND{stage}")),
+            constant(&format!("COMBINER{stage}")),
+            constant(&format!("SCALE{stage}")),
+        ) else {
+            return None;
+        };
+        let passes = sources & 0x000F000F == 0x000F000F && operand & 0x700F == 0 && combiner & 0x000F000F == 0 && scale == 0;
+        if !passes {
+            let rgb: Vec<String> = (0..3).map(|i| color(value((sources >> (i * 4)) & 0xF), (operand >> (i * 4)) & 0xF)).collect();
+            let a: Vec<String> = (0..3).map(|i| alpha(value((sources >> (16 + i * 4)) & 0xF), (operand >> (12 + i * 4)) & 0x7)).collect();
+            let op = |raw: u32| (raw & 0xF).min(9);
+            let rgb_op = match op(combiner) {
+                0 => rgb[0].clone(),
+                1 => format!("{} * {}", rgb[0], rgb[1]),
+                2 => format!("min({} + {}, vec3(1.0))", rgb[0], rgb[1]),
+                3 => format!("clamp({} + {} - 0.5, 0.0, 1.0)", rgb[0], rgb[1]),
+                4 => format!("{0} * {2} + {1} * (vec3(1.0) - {2})", rgb[0], rgb[1], rgb[2]),
+                5 => format!("max({} - {}, vec3(0.0))", rgb[0], rgb[1]),
+                6 | 7 => format!("vec3(clamp(dot({} * 2.0 - 1.0, {} * 2.0 - 1.0), 0.0, 1.0))", rgb[0], rgb[1]),
+                8 => format!("min({} * {} + {}, vec3(1.0))", rgb[0], rgb[1], rgb[2]),
+                _ => format!("min({} + {}, vec3(1.0)) * {}", rgb[0], rgb[1], rgb[2]),
+            };
+            let alpha_op = match op(combiner >> 16) {
+                0 | 6 | 7 => a[0].clone(),
+                1 => format!("{} * {}", a[0], a[1]),
+                2 => format!("min({} + {}, 1.0)", a[0], a[1]),
+                3 => format!("clamp({} + {} - 0.5, 0.0, 1.0)", a[0], a[1]),
+                4 => format!("{0} * {2} + {1} * (1.0 - {2})", a[0], a[1], a[2]),
+                5 => format!("max({} - {}, 0.0)", a[0], a[1]),
+                8 => format!("min({} * {} + {}, 1.0)", a[0], a[1], a[2]),
+                _ => format!("min({} + {}, 1.0) * {}", a[0], a[1], a[2]),
+            };
+            let factor = |raw: u32| ["1.0", "2.0", "4.0", "1.0"][(raw & 3) as usize];
+            let alpha_value = if op(combiner) == 7 { "rgb.r".to_owned() } else { alpha_op };
+            code += &format!(
+                "    {{\n        vec4 k = unpackUnorm4x8(tev[{}].w);\n        vec3 rgb = {rgb_op};\n        float alpha = {alpha_value};\n        previous = clamp(vec4(rgb * {}, alpha * {}), 0.0, 1.0);\n    }}\n",
+                stage * 2,
+                factor(scale),
+                factor(scale >> 16)
+            );
+        }
+        code += "    held = next_buffer;\n";
+        if stage < 4 {
+            if update & (0x100 << stage) != 0 {
+                code += "    next_buffer.rgb = previous.rgb;\n";
+            }
+            if update & (0x1000 << stage) != 0 {
+                code += "    next_buffer.a = previous.a;\n";
+            }
+        }
+    }
+    Some(code)
+}
+
+/// a fragment program of its own for a draw on a Mali, only what the draw
+/// uses written out: its texture units, its combiner stages and its alpha
+/// test, none of the generic shader's functions, tables or switches, which
+/// the Mali-G52 draws the layouts' panes and text wrong with. a draw with
+/// fragment lighting, the procedural texture or fog keeps the generic shader.
+/// the uniform block is the generic shader's, the same words at the same
+/// places
+fn lean_fragment(source: &str, writes_depth: bool) -> Option<String> {
+    let constant = |name: &str| -> Option<u32> {
+        let line = source.lines().find(|line| line.starts_with(&format!("const uint {name} = ")))?;
+        line.rsplit(' ').next()?.trim_end_matches(';').trim_end_matches('u').parse().ok()
+    };
+    let (texture_config, alpha_test, depth_mode, update) = (constant("TEXTURE_CONFIG")?, constant("ALPHA_TEST")?, constant("DEPTH_MODE")?, constant("UPDATE")?);
+    if constant("DYNAMIC")? != 0 || constant("LIGHTING")? != 0 || texture_config & (1 << 10) != 0 || update & 7 == 5 {
+        return None;
+    }
+    let combiners = combiner_code(source)?;
+    let mut out = String::from(
+        "#version 310 es
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+
+layout(location = 0) in vec4 in_color;
+layout(location = 1) in vec4 in_texcoords01;
+layout(location = 2) in vec2 in_texcoord2;
+layout(location = 0) out vec4 out_color;
+
+// what the draw's registers give the stages, as uniforms of the program's
+// own: the Mali-G52 reads a uniform block another draw's words in places.
+// the stages' constant colors, the buffer color and the alpha test, the
+// units' configuration and border, and the depth map's scale and offset
+uniform uvec4 lean[4];
+",
+    );
+    if writes_depth {
+        out += "layout(location = 3) in float in_depth_w;\nlayout(location = 6) in float in_w;\n";
+    }
+    let coordinates = ["in_texcoords01.xy", "in_texcoords01.zw", if texture_config & (1 << 13) != 0 { "in_texcoords01.zw" } else { "in_texcoord2" }];
+    let mut sampling = String::new();
+    for unit in 0..3u32 {
+        if texture_config & (1 << unit) == 0 {
+            continue;
+        }
+        let apart = texture_config & (0x100_0000 << unit) != 0;
+        out += &format!("layout(binding = {unit}) uniform sampler2D texture{unit};\n");
+        if apart {
+            out += &format!("layout(binding = {}) uniform sampler2D alpha{unit};\n", unit + 3);
+        }
+        out += &format!("vec4 sample{unit}(vec2 uv) {{\n");
+        out += &format!("    vec2 st = vec2(uv.x, {});\n", if texture_config & (0x1_0000 << unit) != 0 { "uv.y" } else { "1.0 - uv.y" });
+        if texture_config & (0x10_0000 << unit) == 0 {
+            out += &format!("    uint config = units[{unit}].x;\n    uint wrap_t = (config >> 8) & 7u;\n    uint wrap_s = (config >> 12) & 7u;\n");
+            out += &format!("    if (((wrap_s & 3u) == 1u && (st.x < 0.0 || st.x >= 1.0)) || ((wrap_t & 3u) == 1u && (st.y < 0.0 || st.y >= 1.0))) {{\n        return unpackUnorm4x8(units[{unit}].y);\n    }}\n");
+        }
+        out += &if apart { format!("    return vec4(texture(texture{unit}, st).rgb, texture(alpha{unit}, st).r);\n}}\n") } else { format!("    return texture(texture{unit}, st);\n}}\n") };
+        sampling += &format!("    textures[{unit}] = sample{unit}({});\n", coordinates[unit as usize]);
+    }
+    out += "\nvoid main() {\n    vec4 primary = clamp(in_color, 0.0, 1.0);\n";
+    out += "    vec4 textures[4] = vec4[4](vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0), vec4(0.0, 0.0, 0.0, 1.0));\n";
+    out += &sampling;
+    out += "    vec4 fragment_primary = primary;\n    vec4 fragment_secondary = vec4(0.0, 0.0, 0.0, 1.0);\n";
+    out += "    vec4 previous = primary;\n    vec4 held = vec4(0.0);\n    vec4 next_buffer = unpackUnorm4x8(misc.y);\n";
+    out += &combiners;
+    out += "    vec4 color = floor(previous * 255.0);\n";
+    if alpha_test & 1 != 0 {
+        let passes = match (alpha_test >> 4) & 7 {
+            0 => Some("false"),
+            1 => None,
+            2 => Some("color.a == float((misc.z >> 8) & 0xFFu)"),
+            3 => Some("color.a != float((misc.z >> 8) & 0xFFu)"),
+            4 => Some("color.a < float((misc.z >> 8) & 0xFFu)"),
+            5 => Some("color.a <= float((misc.z >> 8) & 0xFFu)"),
+            6 => Some("color.a > float((misc.z >> 8) & 0xFFu)"),
+            _ => Some("color.a >= float((misc.z >> 8) & 0xFFu)"),
+        };
+        if let Some(passes) = passes {
+            out += &format!("    if (!({passes})) {{\n        discard;\n    }}\n");
+        }
+    }
+    out += "    vec4 written = color / 255.0;\n";
+    if alpha_test & 0x100 != 0 {
+        out += "    written.rgb = vec3(0.0);\n";
+    }
+    if alpha_test & 0x200 != 0 {
+        out += "    written.a = 0.0;\n";
+    }
+    out += "    out_color = written;\n";
+    if writes_depth {
+        out += "    float depth = in_depth_w / in_w;\n";
+        if depth_mode & 2 != 0 {
+            out += "    depth = -gl_FragCoord.z * uintBitsToFloat(flags.z) + uintBitsToFloat(flags.w);\n";
+        }
+        if depth_mode & 1 != 0 {
+            out += "    depth /= gl_FragCoord.w;\n";
+        }
+        out += "    gl_FragDepth = clamp(depth, 0.0, 1.0);\n";
+    }
+    out += "}\n";
+    for (from, to) in [
+        ("tev[0].w", "lean[0].x"),
+        ("tev[2].w", "lean[0].y"),
+        ("tev[4].w", "lean[0].z"),
+        ("tev[6].w", "lean[0].w"),
+        ("tev[8].w", "lean[1].x"),
+        ("tev[10].w", "lean[1].y"),
+        ("misc.y", "lean[1].z"),
+        ("misc.z", "lean[1].w"),
+        ("units[0].x", "lean[2].x"),
+        ("units[0].y", "lean[2].y"),
+        ("units[1].x", "lean[2].z"),
+        ("units[1].y", "lean[2].w"),
+        ("units[2].x", "lean[3].x"),
+        ("units[2].y", "lean[3].y"),
+        ("flags.z", "lean[3].z"),
+        ("flags.w", "lean[3].w"),
+    ] {
+        out = out.replace(from, to);
+    }
+    Some(out)
+}
+
+/// the words of the uniform block a lean program takes as its uniform lean,
+/// in its order.
+const LEAN_WORDS: [usize; 16] = [3, 11, 19, 27, 35, 43, 49, 50, 52, 53, 56, 57, 60, 61, 66, 67];
+
+fn straight_combiners(source: &str) -> String {
+    let Some(code) = combiner_code(source) else {
+        return source.to_owned();
+    };
+    // the buffer color and the alpha test's reference from their registers
+    // at the block's start too
+    let source = source.replace("vec4 next_buffer = colors[6];", "vec4 next_buffer = unpackUnorm4x8(misc.y);").replace("color.a, reference.x)", "color.a, float((misc.z >> 8) & 0xFFu))");
+    let source = source.as_str();
+    let mut out = String::new();
+    let mut written = false;
+    for line in source.lines() {
+        if line.starts_with("    combine_stage(") {
+            if !std::mem::replace(&mut written, true) {
+                out += &code;
+            }
+        } else {
+            out += line;
+            out.push('\n');
+        }
+    }
     out
 }
 
@@ -1195,14 +1465,22 @@ struct DrmEventContext {
     page_flip_handler: Option<FlipHandler>,
 }
 
-/// the panel's refresh count and the time of it, in microseconds of the
-/// monotonic clock, at the last flip.
+/// the first panel's refresh count and the time of it, in microseconds of
+/// the monotonic clock, at its last flip: each panel counts its own
+/// refreshes, so the pace is the first one's.
 static FLIPPED_AT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static FLIPPED_TIME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// the panels whose flip happened, a bit each, as their flips say.
+static FLIPPED_HEADS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-extern "C" fn flipped(_fd: i32, sequence: u32, seconds: u32, microseconds: u32, _data: *mut c_void) {
-    FLIPPED_AT.store(sequence, std::sync::atomic::Ordering::Relaxed);
-    FLIPPED_TIME.store(seconds as u64 * 1_000_000 + microseconds as u64, std::sync::atomic::Ordering::Relaxed);
+/// a flip's event, its data the panel's index plus one.
+extern "C" fn flipped(_fd: i32, sequence: u32, seconds: u32, microseconds: u32, data: *mut c_void) {
+    let head = (data as usize).saturating_sub(1);
+    if head == 0 {
+        FLIPPED_AT.store(sequence, std::sync::atomic::Ordering::Relaxed);
+        FLIPPED_TIME.store(seconds as u64 * 1_000_000 + microseconds as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    FLIPPED_HEADS.fetch_or(1 << head.min(31), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// a native window made by the program around the engine, an Android
@@ -1259,7 +1537,7 @@ pub fn set_second_window(window: *mut c_void) {
 
 /// whether there is a second window for a screen to go to.
 pub fn second_window() -> bool {
-    !SECOND_WINDOW.load(std::sync::atomic::Ordering::Acquire).is_null()
+    !SECOND_WINDOW.load(std::sync::atomic::Ordering::Acquire).is_null() || ADOPTED_SECOND.lock().unwrap().is_some()
 }
 
 /// which screen the second window shows, the top one or the bottom one.
@@ -1322,6 +1600,66 @@ unsafe fn follow_window(egl: &Egl, wanted: *mut c_void) -> bool {
 /// picture was handed over, in nanoseconds, 0 when not known.
 static PANEL_PERIOD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PANEL_SLACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// how a program around the engine puts a picture up on a window it made,
+/// as SDL does on Wayland: given the panel, 0 for the first window and 1 for
+/// the second. Null to swap the surfaces here instead.
+static SWAP: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// hands the renderer the program's own swap, which commits the window's
+/// surface as an EGL swap alone does not on every driver. Call before the
+/// title is loaded.
+pub fn set_swap(swap: extern "C" fn(u32)) {
+    SWAP.store(swap as *mut c_void, std::sync::atomic::Ordering::Release);
+}
+
+/// the program's swap for this panel, when it gave one.
+fn swap_up(head: u32) -> bool {
+    let swap = SWAP.load(std::sync::atomic::Ordering::Acquire);
+    if swap.is_null() {
+        return false;
+    }
+    // SAFETY: the address is the function set_swap was given
+    let swap: extern "C" fn(u32) = unsafe { std::mem::transmute(swap) };
+    swap(head);
+    true
+}
+
+/// an EGL display, config, context and surface the program around the
+/// engine made and handed over, an SDL window's Wayland surface, which the
+/// engine then draws into and swaps by itself.
+pub struct Adopted {
+    display: *mut c_void,
+    config: *mut c_void,
+    context: *mut c_void,
+    surface: *mut c_void,
+    size: (i32, i32),
+}
+
+// SAFETY: the handles are EGL's, which work from any thread once made
+unsafe impl Send for Adopted {}
+
+static ADOPTED: std::sync::Mutex<Option<Adopted>> = std::sync::Mutex::new(None);
+
+/// hands the renderer an EGL display, context and surface to draw into and
+/// swap, for a program around the engine that made its own window, as an SDL
+/// one does on Wayland. Call before the title is loaded.
+pub fn adopt(display: *mut c_void, config: *mut c_void, context: *mut c_void, surface: *mut c_void, width: i32, height: i32) {
+    *ADOPTED.lock().unwrap() = Some(Adopted { display, config, context, surface, size: (width, height) });
+}
+
+/// a second EGL display, context and surface a program around the engine
+/// handed over, its other window's, which the bottom screen goes to.
+static ADOPTED_SECOND: std::sync::Mutex<Option<(usize, (i32, i32))>> = std::sync::Mutex::new(None);
+static ADOPTED_SECOND_CONTEXT: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+
+/// hands the renderer a second surface and the context it is drawn with, for
+/// a program around the engine that made a second window, as the SDL one does
+/// on the RG DS Plus's two panels. Call before the title is loaded.
+pub fn adopt_second(context: *mut c_void, surface: *mut c_void, width: i32, height: i32) {
+    *ADOPTED_SECOND.lock().unwrap() = Some((surface as usize, (width, height)));
+    *ADOPTED_SECOND_CONTEXT.lock().unwrap() = Some(context as usize);
+}
 
 /// the panel's refresh period, and how long before its refresh the last
 /// picture was handed over, when one was since the last call.
@@ -1545,18 +1883,24 @@ impl Kms {
         self.heads.get(head).map_or(self.heads[0].surface, |head| head.surface)
     }
 
-    /// waits for the flip queued last to happen, then lets go of the
-    /// buffer it replaced.
+    /// waits for the flips queued last to happen, every panel's, then lets
+    /// go of the buffers they replaced: a panel whose flip was still to come
+    /// refused the next, and that picture was never shown on it.
     fn settle(&mut self) -> Result<(), String> {
-        if self.heads.iter().all(|head| head.pending.is_none()) {
+        let waiting = self.heads.iter().enumerate().filter(|(_, head)| head.pending.is_some()).fold(0u32, |bits, (index, _)| bits | 1 << index);
+        if waiting == 0 {
             return Ok(());
         }
         // SAFETY: as in open, on the descriptor and buffers this holds
         unsafe {
             let mut context = DrmEventContext { version: 2, vblank_handler: None, page_flip_handler: Some(flipped) };
             let mut poll = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
-            if libc::poll(&mut poll, 1, 100) > 0 {
+            let mut first = false;
+            while FLIPPED_HEADS.load(std::sync::atomic::Ordering::Relaxed) & waiting != waiting && libc::poll(&mut poll, 1, 100) > 0 {
                 call!(self.drm, "drmHandleEvent", fn(i32, *mut DrmEventContext) -> i32, self.fd, &mut context);
+                first |= FLIPPED_HEADS.load(std::sync::atomic::Ordering::Relaxed) & 1 != 0;
+            }
+            if first && waiting & 1 != 0 {
                 let at = FLIPPED_AT.load(std::sync::atomic::Ordering::Relaxed);
                 let slack = FLIPPED_TIME.load(std::sync::atomic::Ordering::Relaxed).wrapping_sub(self.asked);
                 if slack < 100_000 {
@@ -1575,7 +1919,11 @@ impl Kms {
                     self.held_since = std::time::Instant::now();
                 }
             }
-            for head in &mut self.heads {
+            let done = FLIPPED_HEADS.fetch_and(!waiting, std::sync::atomic::Ordering::Relaxed);
+            for (index, head) in self.heads.iter_mut().enumerate() {
+                if done & 1 << index == 0 {
+                    continue;
+                }
                 let Some(pending) = head.pending.take() else { continue };
                 if let Some((bo, fb)) = head.shown.replace(pending) {
                     call!(self.drm, "drmModeRmFB", fn(i32, u32) -> i32, self.fd, fb);
@@ -1654,7 +2002,7 @@ impl Kms {
                 }
                 head.set = true;
                 head.shown = Some((bo, fb));
-            } else if call!(self.drm, "drmModePageFlip", fn(i32, u32, u32, u32, *mut c_void) -> i32, self.fd, head.crtc, fb, 1, std::ptr::null_mut()) == 0 {
+            } else if call!(self.drm, "drmModePageFlip", fn(i32, u32, u32, u32, *mut c_void) -> i32, self.fd, head.crtc, fb, 1, (index + 1) as *mut c_void) == 0 {
                 // a held picture says nothing of how early pictures come
                 self.asked = if paced { 0 } else { monotonic_micros() };
                 head.pending = Some((bo, fb));
@@ -1734,12 +2082,13 @@ fn panel_shape(output: &Output) -> ((i32, i32), Option<i32>) {
         Output::Kms(kms) => kms.size(),
         Output::Fbdev(window) => (window[0] as i32, window[1] as i32),
         Output::Window(size) => *size,
+        Output::Adopted(size) => *size,
         Output::Offscreen(_) => offscreen_size(),
     };
     // a window turns with the device itself
     let turn = match output {
         Output::Kms(_) | Output::Fbdev(_) => panel_turn(size.0, size.1),
-        Output::Window(_) | Output::Offscreen(_) => None,
+        Output::Window(_) | Output::Adopted(_) | Output::Offscreen(_) => None,
     };
     (size, turn)
 }
@@ -1902,8 +2251,21 @@ unsafe fn draw_overlay(gl: &glow::Context, panel: &mut Panel, overlay: &crate::O
 /// on the RX6H crashed in the compiler thread with both at it.
 static COMPILER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// compiler threads beside the GL thread, ZAKURO_COMPILER_THREADS, one by
+/// default; with more each builds on its own and COMPILER_LOCK is not taken,
+/// Mesa's compilers being made for it, as Panfrost's on the RG DS Plus is.
+fn compiler_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| std::env::var("ZAKURO_COMPILER_THREADS").ok().and_then(|n| n.trim().parse().ok()).filter(|&n| n >= 1).unwrap_or(1).min(8))
+}
+
+/// COMPILER_LOCK, held unless the compilers run apart.
+fn compiling() -> Option<std::sync::MutexGuard<'static, ()>> {
+    (compiler_threads() == 1).then(|| COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+}
+
 fn link(gl: &glow::Context, vertex: &str, fragment: &str) -> Result<glow::Program, String> {
-    let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _compiling = compiling();
     // SAFETY: on the GL thread, the shaders are deleted once linked
     unsafe {
         let program = gl.create_program()?;
@@ -1980,6 +2342,9 @@ fn panel_turn(width: i32, height: i32) -> Option<i32> {
 /// the surface on the second window set_second_window gave, made, remade
 /// or let go as the window came, changed or went, and its size.
 fn second_surface(panel: &mut Panel) -> Option<(egl::types::EGLSurface, (i32, i32))> {
+    if let Some((surface, size)) = *ADOPTED_SECOND.lock().unwrap() {
+        return Some((surface as egl::types::EGLSurface, size));
+    }
     let wanted = SECOND_WINDOW.load(std::sync::atomic::Ordering::Acquire);
     let egl = panel.egl;
     if panel.second.is_some_and(|(_, window, _)| window != wanted) {
@@ -2027,7 +2392,9 @@ unsafe fn draw_second(
     parts: Vec<Part>,
 ) -> Result<(), String> {
     let egl = panel.egl;
-    if egl.egl.MakeCurrent(egl.display, surface, surface, egl.context) == 0 {
+    // a second window the program around the engine made has its own context
+    let context = egl.context_alt.unwrap_or(egl.context);
+    if egl.egl.MakeCurrent(egl.display, surface, surface, context) == 0 {
         return Err(format!("could not make the second window current, 0x{:X}", egl.egl.GetError()));
     }
     // the screen's own size is the layout here, its area all of it
@@ -2066,7 +2433,7 @@ unsafe fn draw_second(
     gl.bind_sampler(0, None);
     gl.uniform_1_i32(gl.get_uniform_location(program, "source").as_ref(), 0);
     let drawn = draw_parts(gl, panel, program, linear, None, height, fit, layout, parts);
-    let swapped = egl.egl.SwapBuffers(egl.display, surface) != 0;
+    let swapped = swap_up(1) || egl.egl.SwapBuffers(egl.display, surface) != 0;
     egl.egl.MakeCurrent(egl.display, egl.surface(), egl.surface(), egl.context);
     drawn?;
     if !swapped {
@@ -2213,8 +2580,11 @@ fn show(gl: GlRef, parts: Vec<Part>, frames: u32) -> Result<(), String> {
             per_head.push(parts);
         }
         for (head, parts) in per_head.into_iter().enumerate() {
+            // the panel's own surface, made current and swapped: ARM's driver
+            // swapped the first panel's while the second's was current, Mesa
+            // refuses to
+            let surface = panel.egl.surface_alt.filter(|_| heads > 1 && head == 1).unwrap_or_else(|| panel.egl.surface());
             if heads > 1 {
-                let surface = panel.egl.surface_alt.filter(|_| head == 1).unwrap_or_else(|| panel.egl.surface());
                 // SAFETY: EGL calls on the display and context this panel holds
                 let made = unsafe { panel.egl.egl.MakeCurrent(panel.egl.display, surface, surface, panel.egl.context) };
                 if made == 0 {
@@ -2366,7 +2736,7 @@ fn show(gl: GlRef, parts: Vec<Part>, frames: u32) -> Result<(), String> {
                     gl.bind_texture(glow::TEXTURE_2D, Some(canvas.texture));
                     gl.draw_arrays(glow::TRIANGLES, 0, 3);
                 }
-                if panel.egl.egl.SwapBuffers(panel.egl.display, panel.egl.surface()) == 0 {
+                if !swap_up(0) && panel.egl.egl.SwapBuffers(panel.egl.display, surface) == 0 {
                     return Err("could not swap the panel's buffers".into());
                 }
                 if let Some((surface, size)) = second {
@@ -2434,6 +2804,9 @@ enum Output {
     Fbdev(Box<[u16; 2]>),
     /// a window set_window was given, its size.
     Window((i32, i32)),
+    /// an EGL surface the program around the engine made itself, an SDL
+    /// window's, its size.
+    Adopted((i32, i32)),
     Offscreen(glow::Framebuffer),
 }
 
@@ -2470,6 +2843,8 @@ struct Egl {
     surface: std::sync::atomic::AtomicPtr<c_void>,
     /// the second panel's surface, on a handheld with two.
     surface_alt: Option<egl::types::EGLSurface>,
+    /// the context that surface is drawn with, when it is not this one's.
+    context_alt: Option<egl::types::EGLContext>,
 }
 
 // SAFETY: EGL's entry points can be called from any thread, and the handles
@@ -2620,7 +2995,7 @@ impl Egl {
                 let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
                 remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
             });
-            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None }, gl))
+            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None, context_alt: None }, gl))
         }
     }
 
@@ -2826,7 +3201,42 @@ impl Egl {
             let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
             remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
         });
-        Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None }, gl))
+        Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None, context_alt: None }, gl))
+    }
+
+    /// the display, context and surface a program around the engine handed
+    /// over, made current on this thread.
+    fn adopted(handed: Adopted) -> Result<(Egl, glow::Context), String> {
+        // SAFETY: EGL calls on the handles the program around the engine
+        // made, which stay valid while it plays
+        unsafe {
+            let library = open(&["libEGL.so.1", "libEGL.so"]).map_err(|why| format!("could not load libEGL, {why}"))?;
+            let gles = open(&["libGLESv2.so.2", "libGLESv2.so"]).ok();
+            let loaded = egl::Egl::load_with(|name| symbol(&library, name));
+            let (display, context, surface) = (
+                handed.display as egl::types::EGLDisplay,
+                handed.context as egl::types::EGLContext,
+                handed.surface as egl::types::EGLSurface,
+            );
+            let config = handed.config as egl::types::EGLConfig;
+            if loaded.MakeCurrent(display, surface, surface, context) == 0 {
+                return Err(format!("could not make the window's context current, 0x{:X}", loaded.GetError()));
+            }
+            let gl = glow::Context::from_loader_function(|name| {
+                let direct = gles.as_ref().map_or(std::ptr::null(), |gles| symbol(gles, name));
+                if !direct.is_null() {
+                    return remember(name, direct);
+                }
+                let Ok(c_name) = CString::new(name) else { return std::ptr::null() };
+                // SAFETY: the symbol is looked up in the libraries already loaded
+                let found = libc::dlsym(libc::RTLD_DEFAULT, c_name.as_ptr());
+                if !found.is_null() {
+                    return remember(name, found as *const c_void);
+                }
+                remember(name, loaded.GetProcAddress(c_name.as_ptr()) as *const c_void)
+            });
+            Ok((Egl { libraries: (library, gles), egl: loaded, display, config, context, surface: std::sync::atomic::AtomicPtr::new(surface as *mut c_void), surface_alt: None, context_alt: None }, gl))
+        }
     }
 
     /// a context sharing this one's objects, made current on the calling
@@ -2865,6 +3275,19 @@ impl Egl {
     }
 
     fn new_with_panel() -> Result<(Egl, glow::Context, Option<Output>), String> {
+        if let Some(handed) = ADOPTED.lock().unwrap().take() {
+            let size = handed.size;
+            let (mut egl, gl) = Egl::adopted(handed)?;
+            // the second surface stays where second_surface finds it, frame
+            // after frame
+            if let Some((surface, other)) = *ADOPTED_SECOND.lock().unwrap() {
+                egl.surface_alt = Some(surface as egl::types::EGLSurface);
+                egl.context_alt = ADOPTED_SECOND_CONTEXT.lock().unwrap().take().map(|context| context as egl::types::EGLContext);
+                log::info!("the bottom screen goes to a {}x{} second window", other.0, other.1);
+            }
+            log::info!("the screens go to a {}x{} window of the program around the engine", size.0, size.1);
+            return Ok((egl, gl, Some(Output::Adopted(size))));
+        }
         let window = WINDOW.load(std::sync::atomic::Ordering::Acquire);
         if !window.is_null() {
             let (egl, gl, size) = Egl::new_window(window)?;
@@ -3304,9 +3727,22 @@ impl DrawJob {
                         cache.units[unit] = Some((texture, sampler));
                     }
                 }
+                // a lean program takes its words as uniforms of its own
+                {
+                    thread_local! {
+                        static LEAN: std::cell::RefCell<rustc_hash::FxHashMap<glow::Program, Option<glow::UniformLocation>>> = Default::default();
+                    }
+                    let location = LEAN.with(|lean| lean.borrow_mut().entry(self.program).or_insert_with(|| gl.get_uniform_location(self.program, "lean")).clone());
+                    if let Some(location) = location {
+                        let words = LEAN_WORDS.map(|word| self.uniforms.get(word).copied().unwrap_or(0));
+                        gl.uniform_4_u32_slice(Some(&location), &words);
+                    }
+                }
                 if cache.uniforms != self.uniforms {
-                    let offset = local.uniforms.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&self.uniforms))?;
-                    gl.bind_buffer_range(glow::UNIFORM_BUFFER, 3, Some(local.uniforms.buffer), offset as i32, self.uniforms.len() as i32 * 4);
+                    if !small_uniforms(&gl, 3, word_bytes(&self.uniforms)) {
+                        let offset = local.uniforms.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&self.uniforms))?;
+                        gl.bind_buffer_range(glow::UNIFORM_BUFFER, 3, Some(local.uniforms.buffer), offset as i32, self.uniforms.len() as i32 * 4);
+                    }
                     WORDS.give(std::mem::replace(&mut local.cache.uniforms, self.uniforms));
                 } else {
                     WORDS.give(self.uniforms);
@@ -3351,8 +3787,10 @@ impl DrawJob {
                             cache.cull = Some(cull);
                         }
                         if cache.shading != uniforms {
-                            let offset = local.shading.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&uniforms))?;
-                            gl.bind_buffer_range(glow::UNIFORM_BUFFER, 6, Some(local.shading.buffer), offset as i32, uniforms.len() as i32 * 4);
+                            if !small_uniforms(&gl, 6, word_bytes(&uniforms)) {
+                                let offset = local.shading.push(&gl, glow::UNIFORM_BUFFER, word_bytes(&uniforms))?;
+                                gl.bind_buffer_range(glow::UNIFORM_BUFFER, 6, Some(local.shading.buffer), offset as i32, uniforms.len() as i32 * 4);
+                            }
                             WORDS.give(std::mem::replace(&mut local.cache.shading, uniforms));
                         } else {
                             WORDS.give(uniforms);
@@ -3509,6 +3947,12 @@ struct Occlusion {
 struct Hidden {
     query: Option<(glow::Query, u64)>,
     until: u64,
+    /// the picture it was last drawn in, and whether it was drawn twice in
+    /// one: a mesh the game draws in more than one place, as Super Mario 3D
+    /// Land does its coins, blocks and enemies, is the same mesh to the key,
+    /// and one of them out of view would leave out all of them
+    seen: Option<u64>,
+    shared: bool,
 }
 
 /// heavy draws left out and heavy draws looked at, for ZAKURO_GLES_TIMES.
@@ -3523,10 +3967,17 @@ impl Occlusion {
     /// SAFETY: on the GL thread
     unsafe fn check(&mut self, gl: &glow::Context, key: u64, picture: u64) -> (bool, Option<glow::Query>) {
         if self.meshes.len() > 8192 {
-            self.meshes.retain(|_, mesh| mesh.query.is_some());
+            self.meshes.retain(|_, mesh| mesh.query.is_some() || mesh.shared);
         }
         let Occlusion { meshes, free } = self;
         let mesh = meshes.entry(key).or_default();
+        if mesh.seen == Some(picture) {
+            mesh.shared = true;
+        }
+        mesh.seen = Some(picture);
+        if mesh.shared {
+            return (true, None);
+        }
         unsafe {
             if let Some((query, tried)) = mesh.query {
                 if gl.get_query_parameter_u32(query, glow::QUERY_RESULT_AVAILABLE) != 0 {
@@ -3712,6 +4163,122 @@ fn local<R>(f: impl FnOnce(&mut Local) -> R) -> R {
     LOCAL.with(|local| f(local.borrow_mut().as_mut().expect("the GL thread's state is set up")))
 }
 
+/// on a Mali, a draw's uniform block in a buffer of its own, given new
+/// storage each time: the Mali-G52 reads a block written into a ring through
+/// an unsynchronized mapping as another draw's, the layouts' colors and the
+/// models' matrices from somewhere else. false elsewhere, the ring's
+/// SAFETY: on the GL thread
+unsafe fn small_uniforms(gl: &glow::Context, binding: u32, bytes: &[u8]) -> bool {
+    if !MALI.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    thread_local! {
+        static BUFFERS: std::cell::Cell<[Option<glow::Buffer>; 8]> = const { std::cell::Cell::new([None; 8]) };
+    }
+    let mut buffers = BUFFERS.get();
+    let buffer = match buffers[binding as usize] {
+        Some(buffer) => buffer,
+        None => match gl.create_buffer() {
+            Ok(buffer) => {
+                buffers[binding as usize] = Some(buffer);
+                BUFFERS.set(buffers);
+                buffer
+            }
+            Err(_) => return false,
+        },
+    };
+    gl.bind_buffer(glow::UNIFORM_BUFFER, Some(buffer));
+    gl.buffer_data_u8_slice(glow::UNIFORM_BUFFER, bytes, glow::STREAM_DRAW);
+    gl.bind_buffer_base(glow::UNIFORM_BUFFER, binding, Some(buffer));
+    true
+}
+
+/// a display transfer drawn rather than dispatched, on a Mali: its driver
+/// runs a compute shader apart from the draws around it, so the transfer of
+/// the top screen read the buffer after the title had cleared it and drawn
+/// the bottom screen into it, while draws keep their order among themselves.
+/// the same arithmetic as TRANSFER_SOURCE, a fragment for each pixel written
+/// SAFETY: on the GL thread, both textures rgba8 and apart
+unsafe fn transfer_by_drawing(gl: &glow::Context, source: glow::Texture, target: glow::Texture, t: &Transfer, up: impl Fn(u32) -> u32, row: u32, source_height: u32) {
+    thread_local! {
+        static BLIT: std::cell::Cell<Option<(glow::Program, glow::Framebuffer, glow::VertexArray)>> = const { std::cell::Cell::new(None) };
+    }
+    let (program, framebuffer, empty) = match BLIT.get() {
+        Some(blit) => blit,
+        None => {
+            let fragment = TRANSFER_SOURCE
+                .replace("layout(local_size_x = 8, local_size_y = 8) in;\n", "")
+                .replace("precision highp image2D;\n", "precision highp sampler2D;\n")
+                .replace("layout(binding = 0, rgba8) uniform readonly image2D source;\n", "layout(binding = 0) uniform sampler2D source;\n")
+                .replace("layout(binding = 1, rgba8) uniform writeonly image2D target;\n", "layout(location = 0) out vec4 written;\n")
+                .replace("ivec2 at = ivec2(gl_GlobalInvocationID.xy);", "ivec2 at = ivec2(int(gl_FragCoord.x), output_height - 1 - target_row - int(gl_FragCoord.y));")
+                .replace("imageLoad(source, ivec2(source_column + x, row))", "texelFetch(source, ivec2(source_column + x, row), 0)")
+                .replace("        return;\n    }\n    uvec4 sum", "        discard;\n    }\n    uvec4 sum")
+                .replace("imageStore(target, ivec2(at.x, output_height - 1 - (target_row + at.y)), vec4(pixel) / 255.0);", "written = vec4(pixel) / 255.0;");
+            let vertex = "#version 310 es\nvoid main() {\n    vec2 corner = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));\n    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);\n}\n";
+            let program = match build_program(gl, vertex, &fragment, None) {
+                Ok(program) => program,
+                Err(error) => {
+                    log::warn!("could not build the drawn display transfer, {error}");
+                    return;
+                }
+            };
+            let (Ok(framebuffer), Ok(empty)) = (gl.create_framebuffer(), gl.create_vertex_array()) else {
+                return;
+            };
+            BLIT.set(Some((program, framebuffer, empty)));
+            (program, framebuffer, empty)
+        }
+    };
+    let (width, height, output_height, target_row) = (up(t.copy.0) as i32, up(t.copy.1) as i32, up(t.output_height) as i32, 0);
+    gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+    gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(target), 0);
+    gl.disable(glow::SCISSOR_TEST);
+    gl.disable(glow::BLEND);
+    gl.disable(glow::DEPTH_TEST);
+    gl.disable(glow::STENCIL_TEST);
+    gl.disable(glow::CULL_FACE);
+    gl.color_mask(true, true, true, true);
+    gl.viewport(0, output_height - target_row - height, width, height);
+    gl.use_program(Some(program));
+    let int = |name: &str, value: i32| gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), value);
+    let pair = |name: &str, x: i32, y: i32| gl.uniform_2_i32(gl.get_uniform_location(program, name).as_ref(), x, y);
+    pair("size", width, height);
+    pair("scale", t.scale.0 as i32, t.scale.1 as i32);
+    int("input_height", up(t.input_height) as i32);
+    int("output_height", output_height);
+    int("flip", t.flip as i32);
+    int("input_format", format_index(t.input_format));
+    int("output_format", format_index(t.output_format));
+    int("source_row", up(row) as i32);
+    int("source_column", up(t.column) as i32);
+    int("target_row", target_row);
+    int("source_height", up(source_height) as i32);
+    gl.active_texture(glow::TEXTURE0);
+    gl.bind_texture(glow::TEXTURE_2D, Some(source));
+    gl.bind_sampler(0, None);
+    gl.bind_vertex_array(Some(empty));
+    gl.draw_arrays(glow::TRIANGLES, 0, 3);
+    gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, None, 0);
+    disturb();
+}
+
+/// on a Mali, the drawing before a compute shader and the shader itself
+/// finished before what comes next: its driver runs a dispatch apart from
+/// the draws around it, barrier or not, so a display transfer copied the top
+/// screen after the title had cleared the buffer they share and drawn the
+/// bottom one into it, the bottom screen and the clear's blue on top.
+/// the drawing state is disturbed for the next draw to set again
+/// SAFETY: on the GL thread
+unsafe fn settle_for_compute(gl: &glow::Context) {
+    if MALI.load(std::sync::atomic::Ordering::Relaxed) {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.memory_barrier(glow::ALL_BARRIER_BITS);
+        gl.finish();
+        disturb();
+    }
+}
+
 fn disturb() {
     LOCAL.with(|local| {
         if let Some(local) = local.borrow_mut().as_mut() {
@@ -3728,7 +4295,7 @@ type ProgramKey = ([u32; FRAGMENT_CONSTANTS], bool, Vec<u32>, u64);
 /// when it was made before, its samplers on the texture units.
 fn build_program(gl: &glow::Context, vertex: &str, fragment: &str, cached: Option<&std::path::Path>) -> Result<glow::Program, String> {
     let started = std::time::Instant::now();
-    let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _compiling = compiling();
     // SAFETY: the context is current on this thread, the shaders are deleted
     // once linked into the program
     unsafe {
@@ -3789,7 +4356,7 @@ struct Compile {
 /// driver's compiler.
 struct Compiler {
     jobs: std::sync::mpsc::Sender<Compile>,
-    thread: thread::JoinHandle<()>,
+    threads: Vec<thread::JoinHandle<()>>,
     done: std::sync::mpsc::Receiver<(ProgramKey, Result<glow::Program, String>)>,
     pending: rustc_hash::FxHashSet<ProgramKey>,
     failed: rustc_hash::FxHashMap<ProgramKey, String>,
@@ -3801,30 +4368,43 @@ impl Compiler {
             return None;
         }
         let (jobs, received) = std::sync::mpsc::channel::<Compile>();
+        let received = std::sync::Arc::new(std::sync::Mutex::new(received));
         let (finished, done) = std::sync::mpsc::channel();
         let (ready, started) = std::sync::mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("gles-compiler".into())
-            .spawn(move || {
-                let Some(gl) = egl.shared_context() else {
-                    let _ = ready.send(false);
-                    return;
-                };
-                // SAFETY: lowers the priority of this thread alone, which is
-                // what Linux takes 0 for, the game's threads going first
-                unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
-                let _ = ready.send(true);
-                for job in received {
-                    let result = build_program(&gl, &job.vertex, &job.fragment, job.cached.as_deref());
-                    // SAFETY: the context is current on this thread
-                    unsafe { gl.finish() };
-                    if finished.send((job.key, result)).is_err() {
-                        break;
+        let mut threads = Vec::new();
+        for _ in 0..compiler_threads() {
+            let (received, finished, ready) = (received.clone(), finished.clone(), ready.clone());
+            let thread = thread::Builder::new()
+                .name("gles-compiler".into())
+                .spawn(move || {
+                    let Some(gl) = egl.shared_context() else {
+                        let _ = ready.send(false);
+                        return;
+                    };
+                    // SAFETY: lowers the priority of this thread alone, which is
+                    // what Linux takes 0 for, the game's threads going first
+                    unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, 10) };
+                    let _ = ready.send(true);
+                    loop {
+                        let job = received.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
+                        let Ok(job) = job else { break };
+                        let result = build_program(&gl, &job.vertex, &job.fragment, job.cached.as_deref());
+                        // SAFETY: the context is current on this thread
+                        unsafe { gl.finish() };
+                        if finished.send((job.key, result)).is_err() {
+                            break;
+                        }
                     }
-                }
-            })
-            .ok()?;
-        started.recv().unwrap_or(false).then(|| Compiler { jobs, thread, done, pending: Default::default(), failed: Default::default() })
+                });
+            match thread {
+                Ok(thread) => threads.push(thread),
+                Err(_) => break,
+            }
+        }
+        drop(ready);
+        // the first thread's context decides, the others only add to it
+        let first = started.recv().unwrap_or(false);
+        (first && !threads.is_empty()).then(|| Compiler { jobs, threads, done, pending: Default::default(), failed: Default::default() })
     }
 }
 
@@ -4110,7 +4690,17 @@ impl Gles {
             gl.disable(glow::DITHER);
             log::info!("drawing with OpenGL ES on {name}");
             ADRENO.store(name.contains("Adreno"), std::sync::atomic::Ordering::Relaxed);
-            if gl.supported_extensions().contains("GL_OES_compressed_ETC1_RGB8_texture") && !crate::switch("ZAKURO_NO_ETC1", "ETC1 textures decoded") {
+            // ARM's own driver, not Panfrost on the same GPU, which keeps
+            // GL's order as other drivers do and needs none of the Mali paths
+            PANFROST.store(name.contains("Panfrost"), std::sync::atomic::Ordering::Relaxed);
+            MALI.store(name.contains("Mali") && !name.contains("Panfrost"), std::sync::atomic::Ordering::Relaxed);
+            // the Mali-G52 samples the 3DS's ETC1 blocks black in places, so
+            // there they are decoded
+            let mali = MALI.load(std::sync::atomic::Ordering::Relaxed);
+            if mali {
+                log::info!("ETC1 textures decoded on the Mali");
+            }
+            if !mali && gl.supported_extensions().contains("GL_OES_compressed_ETC1_RGB8_texture") && !crate::switch("ZAKURO_NO_ETC1", "ETC1 textures decoded") {
                 crate::raster::SAMPLES_ETC1.store(true, std::sync::atomic::Ordering::Relaxed);
                 log::info!("ETC1 textures stay compressed");
             }
@@ -5029,9 +5619,15 @@ impl Gles {
             int("source_column", up(t.column) as i32);
             int("target_row", 0);
             int("source_height", up(input_size.1) as i32);
+            if MALI.load(std::sync::atomic::Ordering::Relaxed) {
+                transfer_by_drawing(&gl, source_texture, target_texture, &t, up, row, input_size.1);
+                return;
+            }
             gl.bind_image_texture(0, Some(source_texture), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
             gl.bind_image_texture(1, Some(target_texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+            settle_for_compute(&gl);
             gl.dispatch_compute(up(t.copy.0).div_ceil(8), up(t.copy.1).div_ceil(8), 1);
+            settle_for_compute(&gl);
             gl.memory_barrier(glow::ALL_BARRIER_BITS);
         });
         let target = &mut self.surfaces[target];
@@ -5138,7 +5734,9 @@ impl Gles {
                 int("source_height", height as i32);
                 int("target_row", first as i32);
                 gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
+                settle_for_compute(&gl);
                 gl.dispatch_compute(t.copy.0.div_ceil(8), count.div_ceil(8), 1);
+                settle_for_compute(&gl);
                 gl.memory_barrier(glow::ALL_BARRIER_BITS);
             }
         });
@@ -5151,7 +5749,7 @@ impl Gles {
 
     fn compute(&self, source: &str) -> Result<glow::Program, String> {
         let gl = &self.gl;
-        let _compiling = COMPILER_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _compiling = compiling();
         // SAFETY: the context is current, the shader is deleted once linked
         unsafe {
             let program = gl.create_program()?;
@@ -5252,7 +5850,9 @@ impl Gles {
             gl.uniform_1_i32(gl.get_uniform_location(program, "quarters").as_ref(), quarters as i32);
             gl.bind_image_texture(0, Some(surface.texture), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
             gl.bind_image_texture(1, Some(texture), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+            settle_for_compute(&gl);
             gl.dispatch_compute(up_width.div_ceil(8), up_height.div_ceil(8), 1);
+            settle_for_compute(&gl);
             gl.memory_barrier(glow::ALL_BARRIER_BITS);
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(framebuffer));
             gl.read_buffer(glow::COLOR_ATTACHMENT0);
@@ -5303,7 +5903,7 @@ impl Gles {
         }
         let fragment = if debug == "trivial" {
             "#version 310 es\nprecision highp float;\nlayout(location = 0) in vec4 in_color;\nlayout(location = 0) out vec4 out_color;\nvoid main() { out_color = clamp(in_color, 0.0, 1.0); }\n".to_owned()
-        } else if debug == "simple" {
+        } else if debug == "simple" || debug == "simplemulti" {
             // vertex colors times the textures, in place of the full
             // combiner: the Mali-G52 of the RG DS Plus draws this at the
             // title's own rate where the combiner leaves it blue or slow
@@ -5775,7 +6375,9 @@ impl Gles {
                 gl.uniform_1_i32(location("delta").as_ref(), delta);
                 gl.bind_image_texture(0, Some(source), 0, false, 0, glow::READ_ONLY, glow::RGBA8);
                 gl.bind_image_texture(1, Some(target), 0, false, 0, glow::WRITE_ONLY, glow::RGBA8);
+                settle_for_compute(&gl);
                 gl.dispatch_compute((target_shape[0] as u32).div_ceil(8), (to - from).div_ceil(8), 1);
+                settle_for_compute(&gl);
                 gl.memory_barrier(glow::ALL_BARRIER_BITS);
             }
         });
@@ -6355,6 +6957,19 @@ impl Gles {
                             gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, width, height, glow::RED, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(alphas)));
                         }
                     }
+                    // the Mali-G52 leaves the swizzled one and two channel
+                    // textures out of the draws that read them, the layouts'
+                    // panes and text, so there they go up as whole colors
+                    Some((packing @ (Packing::Luminance | Packing::Alpha | Packing::LuminanceAlpha | Packing::Hilo), bytes)) if MALI.load(std::sync::atomic::Ordering::Relaxed) => {
+                        let rgba: Vec<u8> = match packing {
+                            Packing::Luminance => bytes.iter().flat_map(|&l| [l, l, l, 255]).collect(),
+                            Packing::Alpha => bytes.iter().flat_map(|&a| [0, 0, 0, a]).collect(),
+                            Packing::LuminanceAlpha => bytes.chunks_exact(2).flat_map(|la| [la[0], la[0], la[0], la[1]]).collect(),
+                            _ => bytes.chunks_exact(2).flat_map(|hl| [0, hl[0], hl[1], 255]).collect(),
+                        };
+                        gl.tex_storage_2d(glow::TEXTURE_2D, 1, glow::RGBA8, width, height);
+                        gl.tex_sub_image_2d(glow::TEXTURE_2D, 0, 0, 0, width, height, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&rgba)));
+                    }
                     Some((packing, bytes)) => {
                         use glow::{GREEN, ONE, RED, ZERO};
                         let (internal, format, kind, swizzle) = match packing {
@@ -6828,9 +7443,11 @@ impl Gles {
     /// thread finish what it was sent, before the process ends: the driver's
     /// exit freeing what a build still used corrupted the heap.
     pub fn stop(&mut self) {
-        if let Some(Compiler { jobs, thread, done, .. }) = self.compiler.take() {
+        if let Some(Compiler { jobs, threads, done, .. }) = self.compiler.take() {
             drop((jobs, done));
-            let _ = thread.join();
+            for thread in threads {
+                let _ = thread.join();
+            }
         }
         self.worker.run(|| ());
     }

@@ -183,8 +183,8 @@ fn rk3562_pad(name: &str) -> bool {
     name.trim_matches('"') == "rk3562-joystick"
 }
 
-/// the RG DS Plus's pad: the RK3568 button driver, its face buttons where
-/// the R36S has them and its sticks on ABS_Z/ABS_RX and ABS_RY/ABS_RZ.
+/// the RG DS Plus's pad: the RK3568 button driver, its own numbers for the
+/// buttons and its sticks on ABS_Z/ABS_RX and ABS_RY/ABS_RZ.
 fn rk3568_pad(name: &str) -> bool {
     name.trim_matches('"') == "ANBERNIC-rk3568-keys"
 }
@@ -222,12 +222,12 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
         }
     );
     // the R36S's stick each of axes 0 to 5 is, scaled to its travel
-    let sticks = if h700 {
+    let sticks = if h700 || rk3568 {
         // left stick on ABS_Z and ABS_RX, right on ABS_RY and ABS_RZ
         Some([None, None, Some(0), Some(1), Some(3), Some(4)])
     } else if rk3566 {
         Some([Some(0), Some(1), Some(3), None, None, Some(4)])
-    } else if rk3562 || rk3568 || muos {
+    } else if rk3562 || muos {
         // left stick on ABS_X and ABS_Y, right on ABS_RX and ABS_RY, the
         // triggers on ABS_Z and ABS_RZ, which are buttons here
         Some([Some(0), Some(1), None, Some(3), Some(4), None])
@@ -257,6 +257,12 @@ pub fn read_pad(path: String, name: String, pad: Arc<Mutex<Pad>>) {
             let value = i32::from_ne_bytes([event[20], event[21], event[22], event[23]]);
             let mut pad = pad.lock().unwrap();
             match (kind, sticks) {
+                // the volume buttons, pressed or held, for the sound itself
+                (1, _) if rk3568 && matches!(code, 114 | 115) => {
+                    if value != 0 {
+                        crate::sound::step_volume(code == 115);
+                    }
+                }
                 (1, _) => {
                     let code = if h700 {
                         h700_button(code)
@@ -349,13 +355,24 @@ fn rk3562_button(code: u16) -> u16 {
     }
 }
 
-/// the RG DS Plus's buttons: its kernel reports the extra left and right
-/// buttons as BTN_C and BTN_Z, which stand in for Y, and BTN_MODE as FN.
+/// the RG DS Plus's buttons as the R36S numbers them, as its kernel sends
+/// them: A 304, B 305, X 307, Y 306, L 308, R 309, L2 314, R2 315, select
+/// 310 and start 311, the d-pad a hat.
 fn rk3568_button(code: u16) -> u16 {
     match code {
-        306 | 309 => Y,
-        316 => FN,
-        354 => FN,
+        304 => A,
+        305 => B,
+        306 => Y,
+        307 => X,
+        308 => L1,
+        309 => R1,
+        314 => L2,
+        315 => R2,
+        310 => SELECT,
+        311 => START,
+        316 | 354 => FN,
+        317 => L3,
+        318 => R3,
         other => other,
     }
 }
