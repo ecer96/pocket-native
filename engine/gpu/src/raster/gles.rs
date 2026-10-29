@@ -4394,6 +4394,15 @@ impl Compiler {
                         if finished.send((job.key, result)).is_err() {
                             break;
                         }
+                        // the driver's compiler frees what it took, but glibc
+                        // keeps it in this thread's arena: on a handheld with
+                        // 1 GB and no swap, a level's worth of new programs
+                        // held the game's own code out of memory
+                        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                        // SAFETY: only hands free memory back to the system
+                        unsafe {
+                            libc::malloc_trim(0);
+                        }
                     }
                 });
             match thread {

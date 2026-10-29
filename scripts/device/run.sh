@@ -164,6 +164,9 @@ if [ "$panfrost" = 1 ]; then
     # the uniform rings mapped for good, each quarter fenced
     export LD_LIBRARY_PATH="$mesa${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" XDG_CACHE_HOME="$dir/cache-panfrost" ZAKURO_COMPILER_THREADS=3 ZAKURO_PERSISTENT=1
 fi
+# glibc's arena a thread, each keeping what its thread once took, ran 1 GB
+# with no swap out of memory a level into a game: two for all
+export MALLOC_ARENA_MAX=2
 # GeminusOS's speaker is the amplifier on the second card, not the codec on
 # the first, which is the system's default
 if [ -z "${ZAKURO_ALSA_DEVICE:-}" ] && [ -x /etc/init.d/S49weston ] && [ -d /proc/asound/card1 ]; then
