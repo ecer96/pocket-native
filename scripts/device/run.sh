@@ -6,12 +6,17 @@
 dir="$(cd "$(dirname "$0")" && pwd)"
 
 # on the RG DS Plus, a panfrost folder beside the game holds Mesa and the
-# kernel's Panfrost driver: the GPU goes from ARM's driver to it while the
+# kernel's Panfrost driver, else GeminusOS's own in /usr/lib/panfrost and
+# /lib/modules/panfrost: the GPU goes from ARM's driver to it while the
 # game runs, Weston stopped and the panels driven through KMS, since ARM's
 # driver ran the copies of the screens out of order with the draws. All of
 # it goes back after, and to ARM's driver with Weston if Panfrost won't bind.
 gpu=fde60000.gpu
 panfrost=0
+modules="$dir/panfrost" mesa="$dir/panfrost/lib"
+if [ ! -d "$mesa" ]; then
+    modules=/lib/modules/panfrost mesa=/usr/lib/panfrost
+fi
 menu=/mnt/vendor/ctrl/dmenu_ln
 paused=/tmp/pocket-native-paused
 
@@ -76,9 +81,9 @@ rom="${2:-$game/game.3ds}"
 data="$game/data"
 mkdir -p "$data" "$dir/config"
 
-if [ -d "$dir/panfrost/lib" ] && [ -e /sys/bus/platform/drivers/mali/$gpu ] && [ -x /etc/init.d/S49weston ]; then
+if [ -d "$mesa" ] && [ -e /sys/bus/platform/drivers/mali/$gpu ] && [ -x /etc/init.d/S49weston ]; then
     for module in gpu_sched drm_shmem_helper panfrost; do
-        grep -q "^$module " /proc/modules || insmod "$dir/panfrost/${module/gpu_sched/gpu-sched}.ko"
+        grep -q "^$module " /proc/modules || insmod "$modules/${module/gpu_sched/gpu-sched}.ko"
     done
     if [ -d /sys/bus/platform/drivers/panfrost ]; then
         # the loops that start the launcher held, which with Weston gone
@@ -157,7 +162,7 @@ export XDG_CACHE_HOME="$dir/cache"
 if [ "$panfrost" = 1 ]; then
     # Mesa's programs apart from ARM's, compiled on three cores at once, and
     # the uniform rings mapped for good, each quarter fenced
-    export LD_LIBRARY_PATH="$dir/panfrost/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" XDG_CACHE_HOME="$dir/cache-panfrost" ZAKURO_COMPILER_THREADS=3 ZAKURO_PERSISTENT=1
+    export LD_LIBRARY_PATH="$mesa${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" XDG_CACHE_HOME="$dir/cache-panfrost" ZAKURO_COMPILER_THREADS=3 ZAKURO_PERSISTENT=1
 fi
 # GeminusOS's speaker is the amplifier on the second card, not the codec on
 # the first, which is the system's default
